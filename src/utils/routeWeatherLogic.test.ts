@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { WeatherStation } from '../types/weather';
 import {
+  computeBearingDeg,
   computeDryBypassWaypoint,
   computeTrafficDelayMin,
   evaluateRouteRainExposure,
   extractRainZones,
+  findNearestPointIndex,
   formatDistanceEs,
   formatDurationEs,
   rankRoutes,
@@ -140,4 +142,26 @@ test('traffic delay and Spanish formatting helpers return clean readable values'
   assert.equal(formatDurationEs(75 * 60_000), '1 h 15 min');
   assert.equal(formatDistanceEs(840), '840 m');
   assert.equal(formatDistanceEs(8460), '8.5 km');
+});
+
+test('computeBearingDeg returns accurate compass headings for cardinal directions', () => {
+  const north = computeBearingDeg({ lat: 4.6, lng: -74.08 }, { lat: 4.7, lng: -74.08 });
+  const east = computeBearingDeg({ lat: 4.6, lng: -74.08 }, { lat: 4.6, lng: -73.98 });
+  const south = computeBearingDeg({ lat: 4.7, lng: -74.08 }, { lat: 4.6, lng: -74.08 });
+  const west = computeBearingDeg({ lat: 4.6, lng: -74.08 }, { lat: 4.6, lng: -74.18 });
+
+  assert.ok(north < 1 || north > 359, `Expected ~0 deg north, got ${north}`);
+  assert.ok(Math.abs(east - 90) < 1, `Expected ~90 deg east, got ${east}`);
+  assert.ok(Math.abs(south - 180) < 1, `Expected ~180 deg south, got ${south}`);
+  assert.ok(Math.abs(west - 270) < 1, `Expected ~270 deg west, got ${west}`);
+});
+
+test('findNearestPointIndex snaps live position to closest route point', () => {
+  const path = [
+    { lat: 4.64, lng: -74.06 },
+    { lat: 4.65, lng: -74.07 },
+    { lat: 4.66, lng: -74.08 },
+  ];
+  assert.equal(findNearestPointIndex({ lat: 4.651, lng: -74.069 }, path), 1);
+  assert.equal(findNearestPointIndex({ lat: 4.662, lng: -74.081 }, path), 2);
 });

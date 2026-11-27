@@ -11,10 +11,12 @@ import {
   ChevronLeft,
   ChevronRight,
   CloudRain,
+  Compass,
   Crosshair,
   Footprints,
   Info,
   Layers,
+  Maximize2,
   Minus,
   Navigation,
   Plus,
@@ -26,6 +28,8 @@ import {
 import type { FavoriteLocation, RadarProductsResponse, WeatherStation } from '../types/weather';
 import { classifySabDailyAccumulation } from '../utils/weatherLogic';
 import {
+  computeBearingDeg,
+  findNearestPointIndex,
   formatDistanceEs,
   formatDurationEs,
   type LatLngPoint,
@@ -40,6 +44,8 @@ import {
   type NavTravelMode,
 } from './WazeRouteController';
 
+type CameraMode = 'follow' | 'overview' | 'free';
+
 interface WazeGoogleMapProps {
   apiKey: string;
   center: { latitude: number; longitude: number; locality: string; city: string };
@@ -53,6 +59,7 @@ interface WazeGoogleMapProps {
   onRefreshRadar: () => void;
   onSelectStation: (station: WeatherStation) => void;
   onRouteActiveChange: (active: boolean) => void;
+  onNavigatingChange?: (navigating: boolean) => void;
 }
 
 const SAB_LEGEND_ITEMS = [
@@ -75,29 +82,40 @@ const TRAVEL_MODES: Array<{
 ];
 
 /**
- * Imperative Google Maps layers: TrafficLayer, Bogotá 20 Localidades GeoJSON,
- * live IDIGER 1399BOG Weather Radar GroundOverlay, and camera controls.
+ * Imperative Google Maps layers & Waze-style follow-me camera controller:
+ * TrafficLayer, Bogotá 20 Localidades GeoJSON, live IDIGER 1399BOG Weather Radar GroundOverlay,
+ * close-up driver follow camera (zoom 17–17.5 + tilt + heading), and overview fitBounds toggle.
  */
 const MapOverlaysAndCamera: React.FC<{
   center: { latitude: number; longitude: number; city: string };
+  driverPosition: LatLngPoint;
+  headingDeg: number;
+  activeRoute: ComputedNavRoute | null;
+  isNavigating: boolean;
+  cameraMode: CameraMode;
+  onUserDragMap: () => void;
   radar: RadarProductsResponse | null;
   bogotaGeoJson: unknown | null;
   showTraffic: boolean;
   showRadar: boolean;
   radarOpacity: number;
   theme: 'light' | 'dark';
-  hasActiveRoute: boolean;
   recenterNonce: number;
   zoomDelta: { seq: number; delta: number };
 }> = ({
   center,
+  driverPosition,
+  headingDeg,
+  activeRoute,
+  isNavigating,
+  cameraMode,
+  onUserDragMap,
   radar,
   bogotaGeoJson,
   showTraffic,
   showRadar,
   radarOpacity,
   theme,
-  hasActiveRoute,
   recenterNonce,
   zoomDelta,
 }) => {
@@ -106,6 +124,17 @@ const MapOverlaysAndCamera: React.FC<{
   const groundOverlayRef = useRef<google.maps.GroundOverlay | null>(null);
   const dataLoadedRef = useRef(false);
   const lastCityKeyRef = useRef('');
+
+  // Pause auto-follow cleanly if the user drags the map manually
+  useEffect(() => {
+    if (!map) return;
+    const listener = map.addListener('dragstart', () => {
+      onUserDragMap();
+    });
+    return () => {
+      listener.remove();
+    };
+  }, [map, onUserDragMap]);
 
   // Live Google Traffic Layer
   useEffect(() => {
@@ -165,30 +194,63 @@ const MapOverlaysAndCamera: React.FC<{
     };
   }, [map, showRadar, radar, radarOpacity]);
 
-  // Recenter when city/location changes (unless actively viewing a route)
+  // Waze Close-Up Follow-Me Camera when a route is active
   useEffect(() => {
-    if (!map || hasActiveRoute) return;
+    if (!map || !activeRoute) return;
+
+    if (cameraMode === 'follow') {
+      const targetZoom = isNavigating ? 18 : 17;
+      map.panTo(driverPosition);
+      map.setZoom(targetZoom);
+      return;
+    }
+
+    if (cameraMode === 'overview') {
+      // Frame the entire route only when user explicitly taps "Ver toda la ruta"
+      if (activeRoute.path.length > 1) {
+        const bounds = new google.maps.LatLngBounds();
+        activeRoute.path.forEach((pt) => bounds.extend(pt));
+        map.fitBounds(bounds, { top: 135, bottom: 265, left: 36, right: 36 });
+      } else if (activeRoute.viewport) {
+        map.fitBounds(activeRoute.viewport);
+      }
+    }
+  }, [
+    map,
+    activeRoute?.id,
+    cameraMode,
+    isNavigating,
+    driverPosition.lat,
+    driverPosition.lng,
+    recenterNonce,
+  ]);
+
+  // Recenter cleanly when city/location changes and no route is active
+  useEffect(() => {
+    if (!map || activeRoute) return;
     const key = `${center.city}:${center.latitude.toFixed(3)}:${center.longitude.toFixed(3)}`;
     if (lastCityKeyRef.current === key) return;
     lastCityKeyRef.current = key;
     const isBogota = center.city.toLowerCase().includes('bogot');
-    map.panTo(isBogota ? { lat: 4.635, lng: -74.085 } : { lat: center.latitude, lng: center.longitude });
+    const target = isBogota
+      ? { lat: 4.635, lng: -74.085 }
+      : { lat: center.latitude, lng: center.longitude };
+    map.panTo(target);
     map.setZoom(12);
-  }, [map, center.latitude, center.longitude, center.city, hasActiveRoute]);
+  }, [map, center.latitude, center.longitude, center.city, activeRoute]);
 
-  // Manual recenter trigger
+  // Manual recenter button when no route is active
   useEffect(() => {
-    if (!map || recenterNonce === 0) return;
-    const isBogota = center.city.toLowerCase().includes('bogot');
-    map.panTo(isBogota ? { lat: 4.635, lng: -74.085 } : { lat: center.latitude, lng: center.longitude });
-    map.setZoom(12);
-  }, [map, recenterNonce, center.latitude, center.longitude, center.city]);
+    if (!map || recenterNonce === 0 || activeRoute) return;
+    map.panTo({ lat: center.latitude, lng: center.longitude });
+    map.setZoom(14);
+  }, [map, recenterNonce, activeRoute, center.latitude, center.longitude]);
 
   // Manual zoom buttons
   useEffect(() => {
     if (!map || zoomDelta.seq === 0) return;
     const currentZoom = map.getZoom() ?? 12;
-    map.setZoom(Math.max(5, Math.min(19, currentZoom + zoomDelta.delta)));
+    map.setZoom(Math.max(5, Math.min(20, currentZoom + zoomDelta.delta)));
   }, [map, zoomDelta]);
 
   return null;
@@ -207,6 +269,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
   onRefreshRadar,
   onSelectStation,
   onRouteActiveChange,
+  onNavigatingChange,
 }) => {
   const [showTraffic, setShowTraffic] = useState(true);
   const [showRadar, setShowRadar] = useState(true);
@@ -223,6 +286,11 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
   const [routeError, setRouteError] = useState<string | null>(null);
   const [isNavigating, setIsNavigating] = useState(false);
   const [activeStepIdx, setActiveStepIdx] = useState(0);
+  const [cameraMode, setCameraMode] = useState<CameraMode>('follow');
+
+  // Live GPS tracking while routing/navigating
+  const [liveGpsPos, setLiveGpsPos] = useState<LatLngPoint | null>(null);
+  const [liveGpsHeading, setLiveGpsHeading] = useState<number | null>(null);
 
   const [recenterNonce, setRecenterNonce] = useState(0);
   const [zoomDelta, setZoomDelta] = useState({ seq: 0, delta: 0 });
@@ -241,14 +309,96 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
     onRouteActiveChange(Boolean(destination));
   }, [destination, onRouteActiveChange]);
 
+  useEffect(() => {
+    onNavigatingChange?.(isNavigating);
+  }, [isNavigating, onNavigatingChange]);
+
+  // Real-time GPS watchPosition during active navigation (gracefully falls back when denied/unavailable)
+  useEffect(() => {
+    if (!isNavigating || typeof navigator === 'undefined' || !('geolocation' in navigator)) {
+      setLiveGpsPos(null);
+      setLiveGpsHeading(null);
+      return;
+    }
+
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const nextPt = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setLiveGpsPos(nextPt);
+        if (typeof pos.coords.heading === 'number' && Number.isFinite(pos.coords.heading)) {
+          setLiveGpsHeading(pos.coords.heading);
+        }
+      },
+      () => {
+        // Keep step/origin tracking cleanly without interrupting navigation
+      },
+      { enableHighAccuracy: true, maximumAge: 4000, timeout: 10000 }
+    );
+
+    return () => {
+      navigator.geolocation.clearWatch(watchId);
+    };
+  }, [isNavigating]);
+
+  // Determine the exact live driver position & compass heading along the route
+  const { driverPosition, headingDeg } = useMemo(() => {
+    // 1. Live GPS position takes priority during active navigation
+    if (isNavigating && liveGpsPos) {
+      let heading = liveGpsHeading ?? 0;
+      if (activeRoute && activeRoute.path.length > 1) {
+        const nearestIdx = findNearestPointIndex(liveGpsPos, activeRoute.path);
+        const lookAhead = activeRoute.path[Math.min(nearestIdx + 2, activeRoute.path.length - 1)];
+        if (lookAhead && (lookAhead.lat !== liveGpsPos.lat || lookAhead.lng !== liveGpsPos.lng)) {
+          heading = liveGpsHeading ?? computeBearingDeg(liveGpsPos, lookAhead);
+        }
+      }
+      return { driverPosition: liveGpsPos, headingDeg: heading };
+    }
+
+    // 2. Active step position when stepping through turn-by-turn navigation
+    if (isNavigating && activeRoute && activeRoute.steps[activeStepIdx]?.startLocation) {
+      const stepPos = activeRoute.steps[activeStepIdx].startLocation!;
+      const nextStepPos =
+        activeRoute.steps[activeStepIdx + 1]?.startLocation ??
+        activeRoute.path[activeRoute.path.length - 1] ??
+        stepPos;
+      const brng =
+        nextStepPos.lat !== stepPos.lat || nextStepPos.lng !== stepPos.lng
+          ? computeBearingDeg(stepPos, nextStepPos)
+          : 0;
+      return { driverPosition: stepPos, headingDeg: brng };
+    }
+
+    // 3. Starting corridor position oriented along the first stretch of the computed route
+    if (activeRoute && activeRoute.path.length > 1) {
+      const startPt = activeRoute.path[0];
+      const lookAheadPt = activeRoute.path[Math.min(3, activeRoute.path.length - 1)];
+      return {
+        driverPosition: startPt,
+        headingDeg: computeBearingDeg(startPt, lookAheadPt),
+      };
+    }
+
+    return { driverPosition: originPoint, headingDeg: 0 };
+  }, [isNavigating, liveGpsPos, liveGpsHeading, activeRoute, activeStepIdx, originPoint]);
+
   const handleRoutesComputed = useCallback(
     (computed: ComputedNavRoute[], bestId: string | null) => {
       setRoutes(computed);
       setSelectedRouteId(bestId);
       setActiveStepIdx(0);
+      // Immediately center close-up on the user's position along the route (Waze-style)
+      if (computed.length > 0) {
+        setCameraMode('follow');
+        setRecenterNonce((n) => n + 1);
+      }
     },
     []
   );
+
+  const handleUserDragMap = useCallback(() => {
+    setCameraMode((prev) => (prev === 'follow' ? 'free' : prev));
+  }, []);
 
   const handleClearRoute = () => {
     setDestination(null);
@@ -257,6 +407,9 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
     setRouteError(null);
     setIsNavigating(false);
     setActiveStepIdx(0);
+    setCameraMode('follow');
+    setLiveGpsPos(null);
+    setLiveGpsHeading(null);
   };
 
   const activeStep = activeRoute?.steps[activeStepIdx] ?? null;
@@ -287,13 +440,18 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
               longitude: center.longitude,
               city: center.city,
             }}
+            driverPosition={driverPosition}
+            headingDeg={headingDeg}
+            activeRoute={activeRoute}
+            isNavigating={isNavigating}
+            cameraMode={cameraMode}
+            onUserDragMap={handleUserDragMap}
             radar={radar}
             bogotaGeoJson={bogotaGeoJson}
             showTraffic={showTraffic}
             showRadar={showRadar}
             radarOpacity={radarOpacity}
             theme={theme}
-            hasActiveRoute={Boolean(destination)}
             recenterNonce={recenterNonce}
             zoomDelta={zoomDelta}
           />
@@ -312,9 +470,35 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
             onSelectRoute={setSelectedRouteId}
           />
 
-          {/* Origin Marker (Waze-style blue position dot) */}
-          <AdvancedMarker position={originPoint} title={`Origen: ${center.locality}`} zIndex={40}>
-            <div className="w-5 h-5 rounded-full bg-sky-600 border-[3px] border-white shadow-lg" />
+          {/* Driver Position Marker: Waze-Style Directional Arrow Puck when Routing, Clean Dot Otherwise */}
+          <AdvancedMarker
+            position={driverPosition}
+            title={`Tu posición · ${center.locality}`}
+            zIndex={50}
+          >
+            {activeRoute ? (
+              <div className="relative flex items-center justify-center w-12 h-12">
+                <div className="absolute inset-1 rounded-full bg-sky-500/20 border border-sky-400/50" />
+                <div
+                  style={{
+                    transform: `rotate(${Math.round(headingDeg)}deg)`,
+                  }}
+                  className="relative w-9 h-9 rounded-full bg-white shadow-xl border-2 border-[#0F213D] flex items-center justify-center transition-transform duration-300"
+                >
+                  <svg viewBox="0 0 24 24" className="w-5 h-5" aria-hidden="true">
+                    <path
+                      d="M12 2.5L20 20L12 16.2L4 20L12 2.5Z"
+                      fill="#0284C7"
+                      stroke="#0F213D"
+                      strokeWidth="1.3"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </div>
+              </div>
+            ) : (
+              <div className="w-5 h-5 rounded-full bg-sky-600 border-[3px] border-white shadow-lg" />
+            )}
           </AdvancedMarker>
 
           {/* Destination Marker */}
@@ -398,7 +582,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
             })}
         </GoogleMap>
 
-        {/* Waze-Style "¿A dónde vas?" Floating Search Bar (sits cleanly below top brand header when not navigating) */}
+        {/* Waze-Style "¿A dónde vas?" Floating Search Bar */}
         {!isNavigating && (
           <div className="fixed top-[68px] sm:top-4 left-3.5 right-3.5 sm:left-1/2 sm:-translate-x-1/2 sm:right-auto sm:w-[360px] md:w-[400px] z-20 pointer-events-none pt-safe">
             <DestinationSearchBar
@@ -408,6 +592,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
               onSelectDestination={(dest) => {
                 setDestination(dest);
                 setIsNavigating(false);
+                setCameraMode('follow');
               }}
               onClearDestination={handleClearRoute}
             />
@@ -447,7 +632,10 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                 <button
                   type="button"
                   disabled={activeStepIdx === 0}
-                  onClick={() => setActiveStepIdx((i) => Math.max(0, i - 1))}
+                  onClick={() => {
+                    setActiveStepIdx((i) => Math.max(0, i - 1));
+                    setCameraMode('follow');
+                  }}
                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 disabled:opacity-35 hover:bg-white/20 font-semibold"
                 >
                   <ChevronLeft className="w-3.5 h-3.5" /> Anterior
@@ -458,9 +646,10 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                 <button
                   type="button"
                   disabled={activeStepIdx >= activeRoute.steps.length - 1}
-                  onClick={() =>
-                    setActiveStepIdx((i) => Math.min(activeRoute.steps.length - 1, i + 1))
-                  }
+                  onClick={() => {
+                    setActiveStepIdx((i) => Math.min(activeRoute.steps.length - 1, i + 1));
+                    setCameraMode('follow');
+                  }}
                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 disabled:opacity-35 hover:bg-white/20 font-semibold"
                 >
                   Siguiente <ChevronRight className="w-3.5 h-3.5" />
@@ -470,12 +659,48 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
           </div>
         )}
 
-        {/* Right Edge Minimal Map Controls: Traffic Toggle + Zoom + Recenter */}
+        {/* Quick Floating "Centrar en mí" Re-Lock Pill when user pans away from active route */}
+        {activeRoute && cameraMode !== 'follow' && (
+          <div className="fixed left-3.5 bottom-[244px] sm:bottom-52 z-20">
+            <button
+              type="button"
+              onClick={() => {
+                setCameraMode('follow');
+                setRecenterNonce((n) => n + 1);
+              }}
+              className="min-h-[42px] px-3.5 rounded-full bg-[#0F213D] dark:bg-sky-500 text-white text-xs font-bold shadow-xl inline-flex items-center gap-2 hover:bg-[#17325C] dark:hover:bg-sky-400"
+            >
+              <Compass className="w-4 h-4" />
+              Centrar en mí
+            </button>
+          </div>
+        )}
+
+        {/* Right Edge Minimal Map Controls: Overview/Follow Toggle + Traffic + Zoom + Recenter */}
         <div
           className={`fixed right-3.5 z-20 flex flex-col gap-2 transition-all ${
             destination ? 'bottom-64 sm:bottom-52' : 'bottom-28 sm:bottom-12'
           }`}
         >
+          {activeRoute && (
+            <button
+              type="button"
+              onClick={() => {
+                setCameraMode((m) => (m === 'overview' ? 'follow' : 'overview'));
+                setRecenterNonce((n) => n + 1);
+              }}
+              aria-label={cameraMode === 'overview' ? 'Volver a vista cercana' : 'Ver toda la ruta'}
+              title={cameraMode === 'overview' ? 'Vista cercana' : 'Ver ruta completa'}
+              className={`w-11 h-11 rounded-2xl backdrop-blur-md border shadow-lg flex items-center justify-center transition-colors ${
+                cameraMode === 'overview'
+                  ? 'bg-[#0F213D] dark:bg-sky-500 text-white border-[#0F213D] dark:border-sky-400'
+                  : 'bg-white/92 dark:bg-slate-900/92 text-slate-700 dark:text-slate-200 border-slate-200/80 dark:border-slate-700/80'
+              }`}
+            >
+              <Maximize2 className="w-4 h-4" />
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setShowTraffic((v) => !v)}
@@ -512,16 +737,19 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
 
           <button
             type="button"
-            onClick={() => setRecenterNonce((n) => n + 1)}
-            aria-label="Centrar mapa"
-            title="Centrar mapa"
+            onClick={() => {
+              if (activeRoute) setCameraMode('follow');
+              setRecenterNonce((n) => n + 1);
+            }}
+            aria-label="Centrar en mi ubicación"
+            title="Centrar en mi ubicación"
             className="w-11 h-11 rounded-2xl bg-white/92 dark:bg-slate-900/92 backdrop-blur-md border border-slate-200/80 dark:border-slate-700/80 shadow-lg flex items-center justify-center text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
           >
             <Crosshair className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Bottom-Left Collapsible SAB Legend (only when not covered by route sheet on mobile) */}
+        {/* Bottom-Left Collapsible SAB Legend (only when no route card covers bottom-left) */}
         {!destination && (
           <div className="fixed left-3.5 bottom-6 z-20 flex flex-col items-start gap-2 pb-safe">
             {showLegend && (
@@ -827,7 +1055,9 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                         type="button"
                         onClick={() => {
                           setActiveStepIdx(0);
+                          setCameraMode('follow');
                           setIsNavigating(true);
+                          setRecenterNonce((n) => n + 1);
                         }}
                         className="min-h-[46px] px-5 rounded-2xl bg-[#0F213D] dark:bg-sky-500 hover:bg-[#17325C] dark:hover:bg-sky-400 text-white text-sm font-bold inline-flex items-center gap-2 shadow-lg shrink-0"
                       >

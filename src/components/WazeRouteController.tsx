@@ -274,15 +274,6 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
         computedRoutesRef.current = ranked;
         const bestId = ranked[0]?.id ?? null;
         onRoutesComputed(ranked, bestId);
-
-        // Fit map cleanly around the selected route
-        if (ranked[0]?.path.length > 1) {
-          const bounds = new google.maps.LatLngBounds();
-          ranked[0].path.forEach((pt) => bounds.extend(pt));
-          map.fitBounds(bounds, { top: 140, bottom: 260, left: 36, right: 36 });
-        } else if (ranked[0]?.viewport) {
-          map.fitBounds(ranked[0].viewport);
-        }
       } catch (err) {
         if (isQuotaError(err)) {
           window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));

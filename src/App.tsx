@@ -90,6 +90,7 @@ export default function App() {
   );
   const [quotaExceeded, setQuotaExceeded] = useState(false);
   const [routeActive, setRouteActive] = useState(false);
+  const [isNavigating, setIsNavigating] = useState(false);
   const [wheelOpen, setWheelOpen] = useState(false);
   const [radarBarOpen, setRadarBarOpen] = useState(false);
   const [profileSheetOpen, setProfileSheetOpen] = useState(false);
@@ -446,6 +447,7 @@ export default function App() {
           onRefreshRadar={fetchRadar}
           onSelectStation={(st) => setSelectedStation(st)}
           onRouteActiveChange={setRouteActive}
+          onNavigatingChange={setIsNavigating}
         />
       ) : mapsConfigResolved ? (
         <FullScreenWeatherMap
@@ -467,59 +469,61 @@ export default function App() {
       ) : null}
 
       {/* 2. Top Floating Minimal Header: Brand + Weather Chip (Left) & Profile Circle (Right) */}
-      <header className="fixed top-0 left-0 right-0 z-20 px-3.5 pt-3.5 sm:px-5 sm:pt-4 flex items-start justify-between gap-3 pointer-events-none pt-safe">
-        {/* Compact Brand + Active Location & Live Weather Card */}
-        <button
-          type="button"
-          onClick={() => setLocationSheetOpen(true)}
-          aria-label={`Cambiar ubicación: ${activeLocalityName}, ${activeCityName}`}
-          className="pointer-events-auto min-h-[48px] max-w-[calc(100vw-88px)] sm:max-w-[235px] pl-2.5 pr-3 py-1.5 rounded-2xl bg-white/92 dark:bg-slate-900/92 backdrop-blur-md border border-slate-200/80 dark:border-slate-700/80 shadow-lg hover:bg-white dark:hover:bg-slate-900 flex items-center gap-2.5 text-left transition-colors"
-        >
-          <div className="w-9 h-9 rounded-xl bg-[#0F213D] dark:bg-sky-500 text-white flex items-center justify-center shrink-0">
-            <CloudRain className="w-5 h-5" />
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-extrabold font-display tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
-                No me lavo
-              </span>
-              {weather?.current.temperatureC !== null && weather?.current.temperatureC !== undefined && (
-                <span className="text-xs font-bold font-mono tabular-nums text-sky-700 dark:text-sky-400 whitespace-nowrap">
-                  {formatTemperature(weather.current.temperatureC, preferences.tempUnit)}
+      {!isNavigating && (
+        <header className="fixed top-0 left-0 right-0 z-20 px-3.5 pt-3.5 sm:px-5 sm:pt-4 flex items-start justify-between gap-3 pointer-events-none pt-safe">
+          {/* Compact Brand + Active Location & Live Weather Card */}
+          <button
+            type="button"
+            onClick={() => setLocationSheetOpen(true)}
+            aria-label={`Cambiar ubicación: ${activeLocalityName}, ${activeCityName}`}
+            className="pointer-events-auto min-h-[48px] max-w-[calc(100vw-88px)] sm:max-w-[235px] pl-2.5 pr-3 py-1.5 rounded-2xl bg-white/92 dark:bg-slate-900/92 backdrop-blur-md border border-slate-200/80 dark:border-slate-700/80 shadow-lg hover:bg-white dark:hover:bg-slate-900 flex items-center gap-2.5 text-left transition-colors"
+          >
+            <div className="w-9 h-9 rounded-xl bg-[#0F213D] dark:bg-sky-500 text-white flex items-center justify-center shrink-0">
+              <CloudRain className="w-5 h-5" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-extrabold font-display tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
+                  No me lavo
                 </span>
-              )}
+                {weather?.current.temperatureC !== null && weather?.current.temperatureC !== undefined && (
+                  <span className="text-xs font-bold font-mono tabular-nums text-sky-700 dark:text-sky-400 whitespace-nowrap">
+                    {formatTemperature(weather.current.temperatureC, preferences.tempUnit)}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300 truncate">
+                <span className="truncate font-medium">{activeLocalityName}</span>
+                <span aria-hidden="true">·</span>
+                <span className="truncate text-slate-500 dark:text-slate-400">
+                  {weather?.rainfall.levelLabel ?? 'En vivo'}
+                </span>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              </div>
             </div>
-            <div className="flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300 truncate">
-              <span className="truncate font-medium">{activeLocalityName}</span>
-              <span aria-hidden="true">·</span>
-              <span className="truncate text-slate-500 dark:text-slate-400">
-                {weather?.rainfall.levelLabel ?? 'En vivo'}
-              </span>
-              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-            </div>
-          </div>
-        </button>
+          </button>
 
-        {/* Top-Right Profile Circle ("un círculo para el perfil") */}
-        <button
-          type="button"
-          onClick={() => {
-            setWheelOpen(false);
-            setProfileSheetOpen(true);
-          }}
-          aria-label="Abrir perfil"
-          title="Perfil"
-          className="pointer-events-auto relative w-12 h-12 sm:w-13 sm:h-13 rounded-full bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-2 border-[#0F213D]/15 dark:border-sky-400/35 shadow-lg hover:scale-105 active:scale-95 flex items-center justify-center text-[#0F213D] dark:text-sky-300 transition-transform shrink-0"
-        >
-          <User className="w-5 h-5" />
-          {preferences.gpsEnabled && (
-            <span
-              aria-hidden="true"
-              className="absolute bottom-0.5 right-0.5 w-3 h-3 rounded-full bg-emerald-500 border-2 border-white dark:border-slate-900"
-            />
-          )}
-        </button>
-      </header>
+          {/* Top-Right Profile Circle ("un círculo para el perfil") */}
+          <button
+            type="button"
+            onClick={() => {
+              setWheelOpen(false);
+              setProfileSheetOpen(true);
+            }}
+            aria-label="Abrir perfil"
+            title="Perfil"
+            className="pointer-events-auto relative w-12 h-12 sm:w-13 sm:h-13 rounded-full bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-2 border-[#0F213D]/15 dark:border-sky-400/35 shadow-lg hover:scale-105 active:scale-95 flex items-center justify-center text-[#0F213D] dark:text-sky-300 transition-transform shrink-0"
+          >
+            <User className="w-5 h-5" />
+            {preferences.gpsEnabled && (
+              <span
+                aria-hidden="true"
+                className="absolute bottom-0.5 right-0.5 w-3 h-3 rounded-full bg-emerald-500 border-2 border-white dark:border-slate-900"
+              />
+            )}
+          </button>
+        </header>
+      )}
 
       {/* 3. Bottom-Center Radial Function Wheel ("una rueda para las funciones") */}
       {!routeActive && (

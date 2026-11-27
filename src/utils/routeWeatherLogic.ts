@@ -292,3 +292,41 @@ export function formatDistanceEs(meters: number): string {
   if (meters < 1000) return `${Math.round(meters / 10) * 10} m`;
   return `${(meters / 1000).toFixed(1)} km`;
 }
+
+/**
+ * Computes initial compass bearing in degrees [0, 360) from point A to point B.
+ */
+export function computeBearingDeg(from: LatLngPoint, to: LatLngPoint): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const lat1 = toRad(from.lat);
+  const lat2 = toRad(to.lat);
+  const dLng = toRad(to.lng - from.lng);
+
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  const brng = (Math.atan2(y, x) * 180) / Math.PI;
+  return (brng + 360) % 360;
+}
+
+/**
+ * Finds the index of the closest point along a polyline path to a live GPS position.
+ */
+export function findNearestPointIndex(pos: LatLngPoint, path: LatLngPoint[]): number {
+  if (path.length === 0) return -1;
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < path.length; i++) {
+    const d = calculateDistanceKm(
+      { latitude: pos.lat, longitude: pos.lng },
+      { latitude: path[i].lat, longitude: path[i].lng }
+    );
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
