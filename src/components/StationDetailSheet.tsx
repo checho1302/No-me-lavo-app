@@ -2,6 +2,10 @@ import React, { useEffect, useState } from 'react';
 import { AlertCircle, Clock, Cpu, Droplets, Gauge, Thermometer, Wind, X } from 'lucide-react';
 import type { StationObservationPoint, TraceabilityMeta, UserPreferences, WeatherStation } from '../types/weather';
 import {
+  fetchFallbackStationObservations,
+  fetchJsonOrNull,
+} from '../utils/clientFallbackApi';
+import {
   classifyRainfallIntensity,
   classifySabDailyAccumulation,
   evaluateFreshness,
@@ -28,12 +32,24 @@ export const StationDetailSheet: React.FC<StationDetailSheetProps> = ({
     if (!station) return;
     let cancelled = false;
     setLoading(true);
-    fetch(`/api/v1/stations/${encodeURIComponent(station.id)}/observations`)
-      .then((r) => r.json())
-      .then((data) => {
+    fetchJsonOrNull<{ observations?: StationObservationPoint[]; traceability?: TraceabilityMeta }>(
+      `/api/v1/stations/${encodeURIComponent(station.id)}/observations`
+    )
+      .then(async (data) => {
         if (cancelled) return;
-        setObservations(Array.isArray(data.observations) ? data.observations : []);
-        setTraceability(data.traceability ?? null);
+        if (data) {
+          setObservations(Array.isArray(data.observations) ? data.observations : []);
+          setTraceability(data.traceability ?? null);
+          return;
+        }
+        const fallbackObs = await fetchFallbackStationObservations(
+          station.latitude,
+          station.longitude
+        );
+        if (!cancelled) {
+          setObservations(fallbackObs);
+          setTraceability(null);
+        }
       })
       .catch(() => {
         if (!cancelled) {

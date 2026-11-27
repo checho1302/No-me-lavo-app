@@ -23,6 +23,21 @@ import type {
   WeatherAlert,
   WeatherStation,
 } from './types/weather';
+import {
+  addLocalReport,
+  addLocalRule,
+  deleteLocalFavorite,
+  deleteLocalRule,
+  fetchFallbackBogotaGeoJson,
+  fetchFallbackCoreWeather,
+  fetchFallbackForecast,
+  fetchFallbackRadar,
+  fetchJsonOrNull,
+  getLocalFavorites,
+  getLocalReports,
+  saveLocalFavorite,
+  toggleLocalRule,
+} from './utils/clientFallbackApi';
 import { formatTemperature } from './utils/weatherLogic';
 
 const PREFS_STORAGE_KEY = 'nomelavo_prefs_v1';
@@ -82,12 +97,14 @@ export default function App() {
   const [favorites, setFavorites] = useState<FavoriteLocation[]>([]);
 
   // Minimal floating HUD & modal states
-  const [mapsApiKey, setMapsApiKey] = useState<string>(
-    () => (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined) ?? ''
-  );
-  const [mapsConfigResolved, setMapsConfigResolved] = useState<boolean>(
-    () => Boolean(import.meta.env.VITE_GOOGLE_MAPS_API_KEY)
-  );
+  const [mapsApiKey, setMapsApiKey] = useState<string>(() => {
+    const raw = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined)?.trim() ?? '';
+    return raw && raw !== 'MY_GOOGLE_MAPS_API_KEY' ? raw : '';
+  });
+  const [mapsConfigResolved, setMapsConfigResolved] = useState<boolean>(() => {
+    const raw = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined)?.trim() ?? '';
+    return Boolean(raw && raw !== 'MY_GOOGLE_MAPS_API_KEY');
+  });
   const [quotaExceeded, setQuotaExceeded] = useState(false);
   const [routeActive, setRouteActive] = useState(false);
   const [isNavigating, setIsNavigating] = useState(false);
@@ -124,60 +141,77 @@ export default function App() {
   }, []);
 
   const fetchCoreWeather = useCallback(async () => {
-    const { latitude, longitude } = selectedLoc;
+    const { latitude, longitude, locality, city } = selectedLoc;
     const radiusM = preferences.defaultRadiusKm * 1000;
 
     try {
-      const [nearbyRes, stationsRes, alertsRes] = await Promise.all([
-        fetch(`/api/v1/weather/nearby?latitude=${latitude}&longitude=${longitude}&radius=${radiusM}`),
-        fetch(`/api/v1/stations?latitude=${latitude}&longitude=${longitude}`),
-        fetch(`/api/v1/alerts/nearby?latitude=${latitude}&longitude=${longitude}&radius=${radiusM}`),
-      ]);
-
-      if (nearbyRes.ok) {
-        setWeather((await nearbyRes.json()) as NearbyWeatherResponse);
-      }
-
-      if (stationsRes.ok) {
-        const stationsJson = (await stationsRes.json()) as { stations: WeatherStation[] };
-        setStations(stationsJson.stations ?? []);
-      }
-
-      if (alertsRes.ok) {
-        const alertsJson = (await alertsRes.json()) as {
+      const [nearbyJson, stationsJson, alertsJson] = await Promise.all([
+        fetchJsonOrNull<NearbyWeatherResponse>(
+          `/api/v1/weather/nearby?latitude=${latitude}&longitude=${longitude}&radius=${radiusM}`
+        ),
+        fetchJsonOrNull<{ stations: WeatherStation[] }>(
+          `/api/v1/stations?latitude=${latitude}&longitude=${longitude}`
+        ),
+        fetchJsonOrNull<{
           officialAlerts: WeatherAlert[];
           userRuleAlerts: WeatherAlert[];
           rules: CustomAlertRule[];
-        };
-        setOfficialAlerts(alertsJson.officialAlerts ?? []);
-        setUserRuleAlerts(alertsJson.userRuleAlerts ?? []);
-        setRules(alertsJson.rules ?? []);
+        }>(`/api/v1/alerts/nearby?latitude=${latitude}&longitude=${longitude}&radius=${radiusM}`),
+      ]);
+
+      if (nearbyJson && stationsJson) {
+        setWeather(nearbyJson);
+        setStations(stationsJson.stations ?? []);
+        if (alertsJson) {
+          setOfficialAlerts(alertsJson.officialAlerts ?? []);
+          setUserRuleAlerts(alertsJson.userRuleAlerts ?? []);
+          setRules(alertsJson.rules ?? []);
+        }
+        return;
       }
+
+      // Static hosting fallback (GitHub Pages / Vercel / Netlify without Express backend)
+      const fallback = await fetchFallbackCoreWeather({ latitude, longitude, locality, city });
+      setWeather(fallback.weather);
+      setStations(fallback.stations);
+      setOfficialAlerts(fallback.officialAlerts);
+      setUserRuleAlerts(fallback.userRuleAlerts);
+      setRules(fallback.rules);
     } catch {
       // Keep last known data cleanly
     }
-  }, [selectedLoc.latitude, selectedLoc.longitude, preferences.defaultRadiusKm]);
+  }, [selectedLoc.latitude, selectedLoc.longitude, selectedLoc.locality, selectedLoc.city, preferences.defaultRadiusKm]);
 
   const fetchForecast = useCallback(async () => {
     setForecastLoading(true);
     try {
-      const res = await fetch(
+      const data = await fetchJsonOrNull<ForecastResponse>(
         `/api/v1/forecasts?latitude=${selectedLoc.latitude}&longitude=${selectedLoc.longitude}`
       );
-      if (res.ok) {
-        setForecast((await res.json()) as ForecastResponse);
+      if (data) {
+        setForecast(data);
+        return;
       }
+      const fallback = await fetchFallbackForecast({
+        latitude: selectedLoc.latitude,
+        longitude: selectedLoc.longitude,
+        locality: selectedLoc.locality,
+        city: selectedLoc.city,
+      });
+      if (fallback) setForecast(fallback);
     } finally {
       setForecastLoading(false);
     }
-  }, [selectedLoc.latitude, selectedLoc.longitude]);
+  }, [selectedLoc.latitude, selectedLoc.longitude, selectedLoc.locality, selectedLoc.city]);
 
   const fetchRadar = useCallback(async () => {
     try {
-      const res = await fetch('/api/v1/radar/products');
-      if (res.ok) {
-        setRadar((await res.json()) as RadarProductsResponse);
+      const data = await fetchJsonOrNull<RadarProductsResponse>('/api/v1/radar/products');
+      if (data) {
+        setRadar(data);
+        return;
       }
+      setRadar(await fetchFallbackRadar());
     } catch {
       // Keep previous radar state
     }
@@ -185,17 +219,19 @@ export default function App() {
 
   const fetchUserCollections = useCallback(async () => {
     try {
-      const [reportsRes, favsRes] = await Promise.all([
-        fetch('/api/v1/reports'),
-        fetch('/api/v1/locations/favorites'),
+      const [reportsData, favsData] = await Promise.all([
+        fetchJsonOrNull<{ reports: CitizenReport[] }>('/api/v1/reports'),
+        fetchJsonOrNull<{ favorites: FavoriteLocation[] }>('/api/v1/locations/favorites'),
       ]);
-      if (reportsRes.ok) {
-        const data = (await reportsRes.json()) as { reports: CitizenReport[] };
-        setReports(data.reports ?? []);
+      if (reportsData) {
+        setReports(reportsData.reports ?? []);
+      } else {
+        setReports(getLocalReports());
       }
-      if (favsRes.ok) {
-        const data = (await favsRes.json()) as { favorites: FavoriteLocation[] };
-        setFavorites(data.favorites ?? []);
+      if (favsData) {
+        setFavorites(favsData.favorites ?? []);
+      } else {
+        setFavorites(getLocalFavorites());
       }
     } catch {
       // Keep existing state
@@ -218,15 +254,12 @@ export default function App() {
       setMapsConfigResolved(true);
       return;
     }
-    fetch('/api/v1/maps-config')
-      .then((res) => (res.ok ? res.json() : null))
+    fetchJsonOrNull<{ apiKey?: string }>('/api/v1/maps-config')
       .then((data) => {
-        if (data && typeof data.apiKey === 'string' && data.apiKey.length > 0) {
-          setMapsApiKey(data.apiKey);
+        const key = data?.apiKey?.trim() ?? '';
+        if (key && key !== 'MY_GOOGLE_MAPS_API_KEY') {
+          setMapsApiKey(key);
         }
-      })
-      .catch(() => {
-        // Fallback cleanly if maps config is unavailable
       })
       .finally(() => setMapsConfigResolved(true));
   }, [mapsApiKey]);
@@ -234,11 +267,15 @@ export default function App() {
   useEffect(() => {
     fetchRadar();
     fetchUserCollections();
-    fetch('/api/v1/bogota/localities-geojson')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
+    fetchJsonOrNull<{ type?: string }>('/api/v1/bogota/localities-geojson')
+      .then(async (data) => {
         if (data && data.type === 'FeatureCollection') {
           setBogotaGeoJson(data);
+          return;
+        }
+        const direct = (await fetchFallbackBogotaGeoJson()) as { type?: string } | null;
+        if (direct && direct.type === 'FeatureCollection') {
+          setBogotaGeoJson(direct);
         }
       })
       .catch(() => {
@@ -295,28 +332,36 @@ export default function App() {
     radiusKm: number;
     thresholdMmH: number;
   }) => {
-    const res = await fetch('/api/v1/alerts/rules', {
+    const saved = await fetchJsonOrNull('/api/v1/alerts/rules', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     });
-    if (!res.ok) throw new Error('Error creando regla');
+    if (!saved) {
+      setRules(addLocalRule(input));
+    }
     await fetchCoreWeather();
   };
 
   const handleToggleRule = async (id: string, enabled: boolean) => {
-    await fetch(`/api/v1/alerts/rules/${encodeURIComponent(id)}`, {
+    const saved = await fetchJsonOrNull(`/api/v1/alerts/rules/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled }),
     });
+    if (!saved) {
+      setRules(toggleLocalRule(id, enabled));
+    }
     await fetchCoreWeather();
   };
 
   const handleDeleteRule = async (id: string) => {
-    await fetch(`/api/v1/alerts/rules/${encodeURIComponent(id)}`, {
+    const saved = await fetchJsonOrNull(`/api/v1/alerts/rules/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
+    if (!saved) {
+      setRules(deleteLocalRule(id));
+    }
     await fetchCoreWeather();
   };
 
@@ -329,36 +374,46 @@ export default function App() {
     protectLocation: boolean;
     photoDataUrl: string | null;
   }) => {
-    const res = await fetch('/api/v1/reports', {
+    const saved = await fetchJsonOrNull('/api/v1/reports', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error('Error enviando reporte');
+    if (!saved) {
+      setReports(addLocalReport(payload));
+      return;
+    }
     await fetchUserCollections();
   };
 
   const handleSaveCurrentFavorite = async () => {
-    const res = await fetch('/api/v1/locations/favorites', {
+    const favPayload = {
+      label: weather?.location.locality ?? selectedLoc.locality,
+      locality: weather?.location.locality ?? selectedLoc.locality,
+      city: weather?.location.city ?? selectedLoc.city,
+      latitude: selectedLoc.latitude,
+      longitude: selectedLoc.longitude,
+    };
+    const saved = await fetchJsonOrNull('/api/v1/locations/favorites', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        label: weather?.location.locality ?? selectedLoc.locality,
-        locality: weather?.location.locality ?? selectedLoc.locality,
-        city: weather?.location.city ?? selectedLoc.city,
-        latitude: selectedLoc.latitude,
-        longitude: selectedLoc.longitude,
-      }),
+      body: JSON.stringify(favPayload),
     });
-    if (res.ok) {
-      await fetchUserCollections();
+    if (!saved) {
+      setFavorites(saveLocalFavorite(favPayload));
+      return;
     }
+    await fetchUserCollections();
   };
 
   const handleDeleteFavorite = async (id: string) => {
-    await fetch(`/api/v1/locations/favorites/${encodeURIComponent(id)}`, {
+    const saved = await fetchJsonOrNull(`/api/v1/locations/favorites/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
+    if (!saved) {
+      setFavorites(deleteLocalFavorite(id));
+      return;
+    }
     await fetchUserCollections();
   };
 

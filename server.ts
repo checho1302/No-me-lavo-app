@@ -1,14 +1,14 @@
+import 'dotenv/config';
 import express from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
 import {
   fetchBogotaLocalitiesGeoJson,
   fetchIdigerRadarKmz,
   fetchLiveSabBogotaStations,
-} from './server/sabIngestion';
-import { COLOMBIA_LOCALITIES, RADAR_SITES, STATION_CATALOG } from './src/data/colombiaCatalog';
+} from './server/sabIngestion.ts';
+import { COLOMBIA_LOCALITIES, RADAR_SITES, STATION_CATALOG } from './src/data/colombiaCatalog.ts';
 import type {
   CitizenReport,
   CustomAlertRule,
@@ -23,7 +23,7 @@ import type {
   StationObservationPoint,
   WeatherAlert,
   WeatherStation,
-} from './src/types/weather';
+} from './src/types/weather.ts';
 import {
   calculateDistanceKm,
   classifyRainfallIntensity,
@@ -32,9 +32,9 @@ import {
   fuzzCoordinates,
   validateAlertRuleInput,
   validateCitizenReportInput,
-} from './src/utils/weatherLogic';
+} from './src/utils/weatherLogic.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 // Lightweight TTL cache to separate external ingestion from mobile API reads
@@ -769,10 +769,12 @@ async function startServer() {
   });
 
   app.get('/api/v1/maps-config', (_req, res) => {
-    const apiKey =
+    const rawKey = (
       process.env.VITE_GOOGLE_MAPS_API_KEY ||
       process.env.GOOGLE_MAPS_API_KEY ||
-      '';
+      ''
+    ).trim();
+    const apiKey = rawKey && rawKey !== 'MY_GOOGLE_MAPS_API_KEY' ? rawKey : '';
     res.setHeader('Cache-Control', 'no-store');
     res.json({ apiKey });
   });
@@ -1081,14 +1083,15 @@ async function startServer() {
   });
 
   // --- Vite / Static Frontend Serving ---
+  const distDir = path.resolve(process.cwd(), 'dist');
   if (!IS_PROD) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));

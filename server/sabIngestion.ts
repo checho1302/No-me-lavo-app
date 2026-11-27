@@ -1,10 +1,10 @@
 import zlib from 'node:zlib';
-import type { IdigerRadarOverlay, WeatherStation } from '../src/types/weather';
+import type { IdigerRadarOverlay, WeatherStation } from '../src/types/weather.ts';
 import {
   calculateDistanceKm,
   classifySabDailyAccumulation,
   evaluateFreshness,
-} from '../src/utils/weatherLogic';
+} from '../src/utils/weatherLogic.ts';
 
 const SAB_STATIONS_URL = 'https://app.sab.gov.co/sab/ServletTipoSensores?idtiposensor=5';
 const IDIGER_RADAR_KMZ_URL = 'https://evp.sire.gov.co/radar_animate/datos/kml/reflectividad.kmz';

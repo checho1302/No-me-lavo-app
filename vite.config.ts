@@ -6,7 +6,9 @@ import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
+  const basePath = process.env.VITE_BASE_PATH || '/';
   return {
+    base: basePath,
     plugins: [
       react(),
       tailwindcss(),
@@ -14,15 +16,15 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
-          id: '/',
+          id: basePath,
           name: 'No me lavo app',
           short_name: 'No me lavo app',
           description: 'Mapa de lluvia en vivo, radar, estaciones y pronóstico para Bogotá y Colombia.',
           theme_color: '#0F213D',
           background_color: '#0B1320',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: basePath,
+          scope: basePath,
           lang: 'es',
           icons: [
             {
