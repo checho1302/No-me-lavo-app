@@ -1,0 +1,6 @@
+{
+  "name": "Pluvia Intelligence",
+  "description": "Aplicación meteorológica móvil para consultar lluvia en tiempo real, radar de precipitación, estaciones cercanas, pronósticos y alertas geolocalizadas en Bogotá y Colombia.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
