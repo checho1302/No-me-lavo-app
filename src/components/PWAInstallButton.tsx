@@ -47,7 +47,7 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ compact = fa
           <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 shadow-xl">
             <div className="flex items-start justify-between gap-4">
               <h3 id="pwa-guide-title" className="text-lg font-bold text-slate-900 dark:text-white font-display">
-                Instalar No me lavo en tu teléfono
+                Instalar No me lavo app en tu teléfono
               </h3>
               <button
                 type="button"
@@ -61,7 +61,7 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ compact = fa
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {isIOS
                 ? 'En Safari (iPhone o iPad), pulsa el botón Compartir en la barra inferior y elige "Agregar a pantalla de inicio".'
-                : 'Abre el menú de tu navegador móvil (Chrome, Edge o Safari) y selecciona "Instalar aplicación" o "Agregar a pantalla de inicio" para usar No me lavo en pantalla completa.'}
+                : 'Abre el menú de tu navegador móvil (Chrome, Edge o Safari) y selecciona "Instalar aplicación" o "Agregar a pantalla de inicio" para usar No me lavo app en pantalla completa.'}
             </p>
             <button
               type="button"

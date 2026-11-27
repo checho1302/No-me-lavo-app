@@ -15,8 +15,8 @@ export default defineConfig(() => {
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
-          name: 'No me lavo',
-          short_name: 'No me lavo',
+          name: 'No me lavo app',
+          short_name: 'No me lavo app',
           description: 'Mapa de lluvia en vivo, radar, estaciones y pronóstico para Bogotá y Colombia.',
           theme_color: '#0F213D',
           background_color: '#0B1320',

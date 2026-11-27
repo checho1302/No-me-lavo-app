@@ -92,7 +92,7 @@ async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<Response
   try {
     return await fetch(url, {
       signal: controller.signal,
-      headers: { 'User-Agent': 'PluviaIntelligence/1.0' },
+      headers: { 'User-Agent': 'NoMeLavoApp/1.0' },
     });
   } finally {
     clearTimeout(timer);

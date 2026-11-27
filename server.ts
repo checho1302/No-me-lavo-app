@@ -60,7 +60,7 @@ function checkRateLimit(ip: string, limit = 40, windowMs = 60_000): boolean {
 }
 
 // Persistent JSON store in local app data directory (safe path confined)
-const DATA_DIR = path.resolve(process.cwd(), '.pluvia-data');
+const DATA_DIR = path.resolve(process.cwd(), '.nomelavo-data');
 const STORE_PATH = path.resolve(DATA_DIR, 'store.json');
 
 interface PersistedStore {
@@ -403,7 +403,7 @@ function buildOfficialAlerts(
       type: 'lluvia',
       severity: 'info',
       category: 'official_alert',
-      source: 'Centro de monitoreo Pluvia · Ref. IDEAM / IDIGER',
+      source: 'Centro de monitoreo No me lavo app · Ref. IDEAM / IDIGER',
       locality: localityName,
       latitude: coords.latitude,
       longitude: coords.longitude,
@@ -541,7 +541,7 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  // --- API v1 Routes (aligned with Pluvia Intelligence PDF Architecture) ---
+  // --- API v1 Routes (No me lavo app) ---
 
   app.get('/api/v1/localities', (_req, res) => {
     res.json({ localities: COLOMBIA_LOCALITIES });
@@ -1096,7 +1096,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Pluvia Intelligence server listening on http://localhost:${PORT}`);
+    console.log(`No me lavo app server listening on http://localhost:${PORT}`);
   });
 }
 

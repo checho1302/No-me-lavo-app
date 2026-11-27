@@ -18,7 +18,7 @@ export function createStationLeafletIcon(station: WeatherStation): L.DivIcon {
       <polygon points="12,3 21.5,19.5 2.5,19.5" fill="${sab.color}" stroke="${sab.stroke}" stroke-width="1.8" stroke-linejoin="round"/>
     </svg>`;
     return L.divIcon({
-      className: 'pluvia-sab-triangle-icon',
+      className: 'nomelavo-sab-triangle-icon',
       html,
       iconSize: [22, 22],
       iconAnchor: [11, 14],
@@ -37,7 +37,7 @@ export function createStationLeafletIcon(station: WeatherStation): L.DivIcon {
     <circle cx="9" cy="9" r="6.5" fill="${fill}" stroke="#FFFFFF" stroke-width="2"/>
   </svg>`;
   return L.divIcon({
-    className: 'pluvia-station-circle-icon',
+    className: 'nomelavo-station-circle-icon',
     html,
     iconSize: [18, 18],
     iconAnchor: [9, 9],

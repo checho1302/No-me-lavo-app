@@ -484,7 +484,7 @@ export default function App() {
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
                 <span className="text-sm font-extrabold font-display tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
-                  No me lavo
+                  No me lavo app
                 </span>
                 {weather?.current.temperatureC !== null && weather?.current.temperatureC !== undefined && (
                   <span className="text-xs font-bold font-mono tabular-nums text-sky-700 dark:text-sky-400 whitespace-nowrap">

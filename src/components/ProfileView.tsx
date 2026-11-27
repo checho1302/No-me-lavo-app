@@ -91,7 +91,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   Privacidad y permisos GPS
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
-                  Pluvia no guarda historial continuo de desplazamientos por defecto. El GPS es opcional y puedes revocarlo en cualquier momento.
+                  No me lavo app no guarda historial continuo de desplazamientos por defecto. El GPS es opcional y puedes revocarlo en cualquier momento.
                 </p>
               </div>
             </div>
@@ -221,7 +221,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               Aplicación móvil instalable
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              Agrega Pluvia Intelligence a tu pantalla de inicio en iOS o Android para abrirla sin barras del navegador y conservar los últimos datos en caché.
+              Agrega No me lavo app a tu pantalla de inicio en iOS o Android para abrirla sin barras del navegador y conservar los últimos datos en caché.
             </p>
             <PWAInstallButton />
           </section>

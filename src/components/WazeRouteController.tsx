@@ -330,37 +330,54 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
       rainCirclesRef.current.push(circle);
     }
 
-    // 2. Draw non-selected alternative routes underneath
+    // 2. Draw non-selected alternative routes underneath in subtle neutral slate
     for (const rt of routes) {
       if (rt.id === selectedRouteId || rt.path.length < 2) continue;
+      const altCasing = new google.maps.Polyline({
+        path: rt.path,
+        map,
+        geodesic: true,
+        strokeColor: '#FFFFFF',
+        strokeOpacity: 0.7,
+        strokeWeight: 8,
+        zIndex: 19,
+      });
       const altLine = new google.maps.Polyline({
         path: rt.path,
         map,
         geodesic: true,
-        strokeColor: '#64748B',
-        strokeOpacity: 0.65,
-        strokeWeight: 6,
+        strokeColor: '#94A3B8',
+        strokeOpacity: 0.8,
+        strokeWeight: 5,
         zIndex: 20,
       });
       altLine.addListener('click', () => onSelectRoute(rt.id));
-      polylinesRef.current.push(altLine);
+      polylinesRef.current.push(altCasing, altLine);
     }
 
-    // 3. Draw active selected route on top with crisp Waze-style white border casing
+    // 3. Draw active selected route on top in distinct Waze-style electric purple (#7C3AED)
+    // so it stands out sharply against green/yellow/red traffic and blue water/radar layers
     const active = routes.find((r) => r.id === selectedRouteId) ?? routes[0];
     if (active && active.path.length >= 2) {
-      const mainColor = active.weather.isDry
-        ? '#059669' // Emerald green = Dry recommended route
-        : active.weather.rainExposureScore < 25
-          ? '#0284C7' // Waze sky blue = light humidity
-          : '#D97706'; // Amber = unavoidable rain on route
+      const mainColor = active.weather.rainExposureScore >= 25
+        ? '#C026D3' // Vivid fuchsia-magenta when unavoidable rain is on the route
+        : '#7C3AED'; // Electric Waze purple for the active route to follow
 
+      const outerShadow = new google.maps.Polyline({
+        path: active.path,
+        map,
+        geodesic: true,
+        strokeColor: '#3B0764',
+        strokeOpacity: 0.35,
+        strokeWeight: 14,
+        zIndex: 29,
+      });
       const casing = new google.maps.Polyline({
         path: active.path,
         map,
         geodesic: true,
         strokeColor: '#FFFFFF',
-        strokeOpacity: 0.95,
+        strokeOpacity: 0.98,
         strokeWeight: 11,
         zIndex: 30,
       });
@@ -370,10 +387,10 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
         geodesic: true,
         strokeColor: mainColor,
         strokeOpacity: 1,
-        strokeWeight: 7,
+        strokeWeight: 7.5,
         zIndex: 31,
       });
-      polylinesRef.current.push(casing, core);
+      polylinesRef.current.push(outerShadow, casing, core);
     }
 
     return () => {

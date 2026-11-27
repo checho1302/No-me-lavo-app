@@ -69,7 +69,7 @@ export const ProfileSheet: React.FC<ProfileSheetProps> = ({
             </div>
             <div className="min-w-0">
               <h2 id="profile-sheet-title" className="text-base font-bold text-slate-900 dark:text-white font-display truncate">
-                Mi perfil · No me lavo
+                Mi perfil · No me lavo app
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
                 {activeLocation.locality}, {activeLocation.city}
