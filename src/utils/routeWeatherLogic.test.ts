@@ -11,6 +11,8 @@ import {
   formatDistanceEs,
   formatDurationEs,
   rankRoutes,
+  resolveLocalityLabelForGps,
+  shouldRecalculateRouteOrigin,
 } from './routeWeatherLogic';
 
 function makeStation(overrides: Partial<WeatherStation> & { accDayMm?: number; isRainingNow?: boolean }): WeatherStation {
@@ -165,3 +167,28 @@ test('findNearestPointIndex snaps live position to closest route point', () => {
   assert.equal(findNearestPointIndex({ lat: 4.651, lng: -74.069 }, path), 1);
   assert.equal(findNearestPointIndex({ lat: 4.662, lng: -74.081 }, path), 2);
 });
+
+test('shouldRecalculateRouteOrigin ignores minor GPS jitter and triggers on real movement', () => {
+  const start = { lat: 4.6761, lng: -74.0483 };
+  // First fix always triggers
+  assert.equal(shouldRecalculateRouteOrigin(null, start), true);
+  // 15m indoor drift should NOT spam Routes API
+  assert.equal(shouldRecalculateRouteOrigin(start, { lat: 4.6762, lng: -74.04835 }, 120), false);
+  // 350m movement MUST trigger route recalculation from new GPS location
+  assert.equal(shouldRecalculateRouteOrigin(start, { lat: 4.6793, lng: -74.0483 }, 120), true);
+});
+
+test('resolveLocalityLabelForGps matches nearby locality and falls back cleanly outside coverage', () => {
+  const catalog = [
+    { name: 'Chapinero', city: 'Bogotá', latitude: 4.6486, longitude: -74.0628 },
+    { name: 'Usaquén', city: 'Bogotá', latitude: 4.7045, longitude: -74.0315 },
+  ];
+  const nearUsaquen = resolveLocalityLabelForGps(4.699, -74.033, catalog);
+  assert.equal(nearUsaquen.locality, 'Usaquén');
+  assert.equal(nearUsaquen.city, 'Bogotá');
+
+  const outside = resolveLocalityLabelForGps(10.391, -75.479, catalog);
+  assert.equal(outside.locality, 'Mi ubicación GPS');
+  assert.equal(outside.city, 'En vivo');
+});
+

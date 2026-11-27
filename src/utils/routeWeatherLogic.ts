@@ -330,3 +330,47 @@ export function findNearestPointIndex(pos: LatLngPoint, path: LatLngPoint[]): nu
   return bestIdx;
 }
 
+/**
+ * Decides whether a new GPS position has moved far enough from the last computed route origin
+ * to justify recalculating the route without spamming the Routes API on minor GPS jitter.
+ */
+export function shouldRecalculateRouteOrigin(
+  previousOrigin: LatLngPoint | null,
+  currentPos: LatLngPoint,
+  minMoveMeters = 120
+): boolean {
+  if (!previousOrigin) return true;
+  const distKm = calculateDistanceKm(
+    { latitude: previousOrigin.lat, longitude: previousOrigin.lng },
+    { latitude: currentPos.lat, longitude: currentPos.lng }
+  );
+  return distKm * 1000 >= minMoveMeters;
+}
+
+/**
+ * Maps real device GPS coordinates to the nearest known Colombian locality when within range,
+ * or returns a neutral live GPS label when the user is outside catalog coverage.
+ */
+export function resolveLocalityLabelForGps(
+  latitude: number,
+  longitude: number,
+  localities: Array<{ name: string; city: string; latitude: number; longitude: number }>,
+  maxMatchKm = 25
+): { locality: string; city: string } {
+  let closest: { name: string; city: string; dist: number } | null = null;
+  for (const loc of localities) {
+    const dist = calculateDistanceKm(
+      { latitude, longitude },
+      { latitude: loc.latitude, longitude: loc.longitude }
+    );
+    if (!closest || dist < closest.dist) {
+      closest = { name: loc.name, city: loc.city, dist };
+    }
+  }
+  if (closest && closest.dist <= maxMatchKm) {
+    return { locality: closest.name, city: closest.city };
+  }
+  return { locality: 'Mi ubicación GPS', city: 'En vivo' };
+}
+
+

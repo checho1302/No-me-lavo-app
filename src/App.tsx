@@ -38,6 +38,10 @@ import {
   saveLocalFavorite,
   toggleLocalRule,
 } from './utils/clientFallbackApi';
+import {
+  resolveLocalityLabelForGps,
+  shouldRecalculateRouteOrigin,
+} from './utils/routeWeatherLogic';
 import { formatTemperature } from './utils/weatherLogic';
 
 const PREFS_STORAGE_KEY = 'nomelavo_prefs_v1';
@@ -120,6 +124,15 @@ export default function App() {
 
   const [gpsLoading, setGpsLoading] = useState(false);
   const [gpsError, setGpsError] = useState<string | null>(null);
+  const [gpsStatus, setGpsStatus] = useState<'locating' | 'active' | 'denied' | 'manual'>('locating');
+  const [liveGps, setLiveGps] = useState<{
+    lat: number;
+    lng: number;
+    heading: number | null;
+    accuracyM: number | null;
+  } | null>(null);
+  const manualOverrideRef = React.useRef(false);
+  const lastWeatherGpsRef = React.useRef<{ lat: number; lng: number } | null>(null);
 
   // Sync Tailwind .dark class on <html>
   useEffect(() => {
@@ -283,36 +296,108 @@ export default function App() {
       });
   }, [fetchRadar, fetchUserCollections]);
 
-  const handleRequestGps = () => {
+  const applyGpsCoordinates = useCallback(
+    (pos: GeolocationPosition, forceUpdateLocation = false) => {
+      const lat = Number(pos.coords.latitude.toFixed(5));
+      const lng = Number(pos.coords.longitude.toFixed(5));
+      const heading =
+        typeof pos.coords.heading === 'number' && Number.isFinite(pos.coords.heading)
+          ? pos.coords.heading
+          : null;
+      const accuracyM =
+        typeof pos.coords.accuracy === 'number' && Number.isFinite(pos.coords.accuracy)
+          ? Math.round(pos.coords.accuracy)
+          : null;
+
+      setLiveGps({ lat, lng, heading, accuracyM });
+      setGpsStatus('active');
+      setGpsLoading(false);
+      setGpsError(null);
+      updatePreferences({ gpsEnabled: true });
+
+      if (manualOverrideRef.current && !forceUpdateLocation) return;
+
+      // Sync weather/locality query only on first fix, manual request, or real movement (>250m)
+      if (
+        forceUpdateLocation ||
+        shouldRecalculateRouteOrigin(lastWeatherGpsRef.current, { lat, lng }, 250)
+      ) {
+        lastWeatherGpsRef.current = { lat, lng };
+        const resolved = resolveLocalityLabelForGps(lat, lng, COLOMBIA_LOCALITIES);
+        setSelectedLoc({
+          label: 'Mi ubicación',
+          locality: resolved.locality,
+          city: resolved.city,
+          latitude: lat,
+          longitude: lng,
+          isGps: true,
+        });
+      }
+    },
+    [updatePreferences]
+  );
+
+  // Automatically request & track each user's mobile device GPS on app startup
+  useEffect(() => {
     if (typeof navigator === 'undefined' || !('geolocation' in navigator)) {
+      setGpsStatus('denied');
+      return;
+    }
+
+    setGpsStatus('locating');
+    let watchId: number | null = null;
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => applyGpsCoordinates(pos, false),
+      () => {
+        setGpsStatus((prev) => (prev === 'active' ? prev : 'denied'));
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 }
+    );
+
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => applyGpsCoordinates(pos, false),
+      () => {
+        setGpsStatus((prev) => (prev === 'active' ? prev : 'denied'));
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 5000 }
+    );
+
+    return () => {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+      }
+    };
+  }, [applyGpsCoordinates]);
+
+  const handleRequestGps = useCallback(() => {
+    if (typeof navigator === 'undefined' || !('geolocation' in navigator)) {
+      setGpsStatus('denied');
       setGpsError('Tu navegador no admite geolocalización GPS. Selecciona una localidad manualmente.');
       return;
     }
+    manualOverrideRef.current = false;
     setGpsLoading(true);
+    setGpsStatus('locating');
     setGpsError(null);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setGpsLoading(false);
-        updatePreferences({ gpsEnabled: true });
-        setSelectedLoc({
-          label: 'Mi ubicación',
-          locality: 'Ubicación GPS',
-          city: 'Colombia',
-          latitude: Number(pos.coords.latitude.toFixed(4)),
-          longitude: Number(pos.coords.longitude.toFixed(4)),
-          isGps: true,
-        });
+        applyGpsCoordinates(pos, true);
         setLocationSheetOpen(false);
       },
       () => {
         setGpsLoading(false);
-        setGpsError('Permiso de ubicación no concedido. Puedes elegir cualquier localidad manualmente.');
+        setGpsStatus('denied');
+        setGpsError('Activa el permiso de ubicación en tu navegador/teléfono para iniciar la ruta desde donde estás.');
       },
-      { enableHighAccuracy: false, timeout: 7000, maximumAge: 60000 }
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
-  };
+  }, [applyGpsCoordinates]);
 
   const handleRevokeGps = () => {
+    manualOverrideRef.current = true;
+    setLiveGps(null);
+    setGpsStatus('manual');
     updatePreferences({ gpsEnabled: false });
     setSelectedLoc({
       label: COLOMBIA_LOCALITIES[0].name,
@@ -491,7 +576,11 @@ export default function App() {
             longitude: selectedLoc.longitude,
             locality: activeLocalityName,
             city: activeCityName,
+            isGps: selectedLoc.isGps,
           }}
+          liveGps={liveGps}
+          gpsStatus={gpsStatus}
+          onRequestGps={handleRequestGps}
           stations={stations}
           radar={radar}
           bogotaGeoJson={bogotaGeoJson}
@@ -612,6 +701,8 @@ export default function App() {
         onRevokeGps={handleRevokeGps}
         onSaveCurrentFavorite={handleSaveCurrentFavorite}
         onSelectFavorite={(fav) => {
+          manualOverrideRef.current = true;
+          setGpsStatus('manual');
           setSelectedLoc({
             label: fav.label,
             locality: fav.locality,
@@ -635,6 +726,8 @@ export default function App() {
         gpsLoading={gpsLoading}
         gpsError={gpsError}
         onSelectLocality={(loc) => {
+          manualOverrideRef.current = !loc.isGps;
+          setGpsStatus(loc.isGps ? 'active' : 'manual');
           setSelectedLoc({
             ...loc,
             isGps: Boolean(loc.isGps),

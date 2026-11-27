@@ -32,6 +32,7 @@ import {
   findNearestPointIndex,
   formatDistanceEs,
   formatDurationEs,
+  shouldRecalculateRouteOrigin,
   type LatLngPoint,
 } from '../utils/routeWeatherLogic';
 import {
@@ -46,9 +47,25 @@ import {
 
 type CameraMode = 'follow' | 'overview' | 'free';
 
+export interface LiveGpsFix {
+  lat: number;
+  lng: number;
+  heading: number | null;
+  accuracyM: number | null;
+}
+
 interface WazeGoogleMapProps {
   apiKey: string;
-  center: { latitude: number; longitude: number; locality: string; city: string };
+  center: {
+    latitude: number;
+    longitude: number;
+    locality: string;
+    city: string;
+    isGps?: boolean;
+  };
+  liveGps: LiveGpsFix | null;
+  gpsStatus: 'locating' | 'active' | 'denied' | 'manual';
+  onRequestGps: () => void;
   stations: WeatherStation[];
   radar: RadarProductsResponse | null;
   bogotaGeoJson: unknown | null;
@@ -87,7 +104,7 @@ const TRAVEL_MODES: Array<{
  * close-up driver follow camera (zoom 17–17.5 + tilt + heading), and overview fitBounds toggle.
  */
 const MapOverlaysAndCamera: React.FC<{
-  center: { latitude: number; longitude: number; city: string };
+  center: { latitude: number; longitude: number; city: string; isGps?: boolean };
   driverPosition: LatLngPoint;
   headingDeg: number;
   activeRoute: ComputedNavRoute | null;
@@ -225,26 +242,31 @@ const MapOverlaysAndCamera: React.FC<{
     recenterNonce,
   ]);
 
-  // Recenter cleanly when city/location changes and no route is active
+  // Recenter cleanly when GPS locks or city/location changes and no route is active
   useEffect(() => {
     if (!map || activeRoute) return;
-    const key = `${center.city}:${center.latitude.toFixed(3)}:${center.longitude.toFixed(3)}`;
+    const key = `${center.isGps ? 'gps' : 'manual'}:${center.city}:${center.latitude.toFixed(3)}:${center.longitude.toFixed(3)}`;
     if (lastCityKeyRef.current === key) return;
     lastCityKeyRef.current = key;
+    if (center.isGps) {
+      map.panTo({ lat: center.latitude, lng: center.longitude });
+      map.setZoom(14);
+      return;
+    }
     const isBogota = center.city.toLowerCase().includes('bogot');
     const target = isBogota
       ? { lat: 4.635, lng: -74.085 }
       : { lat: center.latitude, lng: center.longitude };
     map.panTo(target);
     map.setZoom(12);
-  }, [map, center.latitude, center.longitude, center.city, activeRoute]);
+  }, [map, center.latitude, center.longitude, center.city, center.isGps, activeRoute]);
 
   // Manual recenter button when no route is active
   useEffect(() => {
     if (!map || recenterNonce === 0 || activeRoute) return;
-    map.panTo({ lat: center.latitude, lng: center.longitude });
-    map.setZoom(14);
-  }, [map, recenterNonce, activeRoute, center.latitude, center.longitude]);
+    map.panTo(driverPosition);
+    map.setZoom(15);
+  }, [map, recenterNonce, activeRoute, driverPosition.lat, driverPosition.lng]);
 
   // Manual zoom buttons
   useEffect(() => {
@@ -259,6 +281,9 @@ const MapOverlaysAndCamera: React.FC<{
 export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
   apiKey,
   center,
+  liveGps,
+  gpsStatus,
+  onRequestGps,
   stations,
   radar,
   bogotaGeoJson,
@@ -288,17 +313,26 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
   const [activeStepIdx, setActiveStepIdx] = useState(0);
   const [cameraMode, setCameraMode] = useState<CameraMode>('follow');
 
-  // Live GPS tracking while routing/navigating
-  const [liveGpsPos, setLiveGpsPos] = useState<LatLngPoint | null>(null);
-  const [liveGpsHeading, setLiveGpsHeading] = useState<number | null>(null);
-
   const [recenterNonce, setRecenterNonce] = useState(0);
   const [zoomDelta, setZoomDelta] = useState({ seq: 0, delta: 0 });
 
-  const originPoint: LatLngPoint = useMemo(
-    () => ({ lat: center.latitude, lng: center.longitude }),
-    [center.latitude, center.longitude]
-  );
+  // Always prefer the real mobile device GPS position when available (unless user manually picked another city)
+  const currentUserPoint: LatLngPoint = useMemo(() => {
+    if (gpsStatus === 'active' && liveGps) {
+      return { lat: liveGps.lat, lng: liveGps.lng };
+    }
+    return { lat: center.latitude, lng: center.longitude };
+  }, [gpsStatus, liveGps?.lat, liveGps?.lng, center.latitude, center.longitude]);
+
+  // Debounced/thresholded route origin so real GPS fixes immediately start routes from the user's location
+  // without re-calling Google Routes API on tiny 5-meter GPS jitter.
+  const [routeOrigin, setRouteOrigin] = useState<LatLngPoint>(currentUserPoint);
+
+  useEffect(() => {
+    if (shouldRecalculateRouteOrigin(routeOrigin, currentUserPoint, 100)) {
+      setRouteOrigin(currentUserPoint);
+    }
+  }, [currentUserPoint.lat, currentUserPoint.lng]);
 
   const activeRoute = useMemo(
     () => routes.find((r) => r.id === selectedRouteId) ?? routes[0] ?? null,
@@ -313,50 +347,13 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
     onNavigatingChange?.(isNavigating);
   }, [isNavigating, onNavigatingChange]);
 
-  // Real-time GPS watchPosition during active navigation (gracefully falls back when denied/unavailable)
-  useEffect(() => {
-    if (!isNavigating || typeof navigator === 'undefined' || !('geolocation' in navigator)) {
-      setLiveGpsPos(null);
-      setLiveGpsHeading(null);
-      return;
-    }
-
-    const watchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        const nextPt = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        setLiveGpsPos(nextPt);
-        if (typeof pos.coords.heading === 'number' && Number.isFinite(pos.coords.heading)) {
-          setLiveGpsHeading(pos.coords.heading);
-        }
-      },
-      () => {
-        // Keep step/origin tracking cleanly without interrupting navigation
-      },
-      { enableHighAccuracy: true, maximumAge: 4000, timeout: 10000 }
-    );
-
-    return () => {
-      navigator.geolocation.clearWatch(watchId);
-    };
-  }, [isNavigating]);
-
   // Determine the exact live driver position & compass heading along the route
   const { driverPosition, headingDeg } = useMemo(() => {
-    // 1. Live GPS position takes priority during active navigation
-    if (isNavigating && liveGpsPos) {
-      let heading = liveGpsHeading ?? 0;
-      if (activeRoute && activeRoute.path.length > 1) {
-        const nearestIdx = findNearestPointIndex(liveGpsPos, activeRoute.path);
-        const lookAhead = activeRoute.path[Math.min(nearestIdx + 2, activeRoute.path.length - 1)];
-        if (lookAhead && (lookAhead.lat !== liveGpsPos.lat || lookAhead.lng !== liveGpsPos.lng)) {
-          heading = liveGpsHeading ?? computeBearingDeg(liveGpsPos, lookAhead);
-        }
-      }
-      return { driverPosition: liveGpsPos, headingDeg: heading };
-    }
+    const livePos = gpsStatus === 'active' && liveGps ? { lat: liveGps.lat, lng: liveGps.lng } : null;
+    const liveHeading = gpsStatus === 'active' && liveGps ? liveGps.heading : null;
 
-    // 2. Active step position when stepping through turn-by-turn navigation
-    if (isNavigating && activeRoute && activeRoute.steps[activeStepIdx]?.startLocation) {
+    // 1. Active turn-by-turn step preview when user explicitly steps forward/back
+    if (isNavigating && activeStepIdx > 0 && activeRoute?.steps[activeStepIdx]?.startLocation) {
       const stepPos = activeRoute.steps[activeStepIdx].startLocation!;
       const nextStepPos =
         activeRoute.steps[activeStepIdx + 1]?.startLocation ??
@@ -369,6 +366,19 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
       return { driverPosition: stepPos, headingDeg: brng };
     }
 
+    // 2. Real-time mobile GPS position ALWAYS takes priority for the user's puck
+    if (livePos) {
+      let heading = liveHeading ?? 0;
+      if (activeRoute && activeRoute.path.length > 1) {
+        const nearestIdx = findNearestPointIndex(livePos, activeRoute.path);
+        const lookAhead = activeRoute.path[Math.min(nearestIdx + 2, activeRoute.path.length - 1)];
+        if (lookAhead && (lookAhead.lat !== livePos.lat || lookAhead.lng !== livePos.lng)) {
+          heading = liveHeading ?? computeBearingDeg(livePos, lookAhead);
+        }
+      }
+      return { driverPosition: livePos, headingDeg: heading };
+    }
+
     // 3. Starting corridor position oriented along the first stretch of the computed route
     if (activeRoute && activeRoute.path.length > 1) {
       const startPt = activeRoute.path[0];
@@ -379,8 +389,8 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
       };
     }
 
-    return { driverPosition: originPoint, headingDeg: 0 };
-  }, [isNavigating, liveGpsPos, liveGpsHeading, activeRoute, activeStepIdx, originPoint]);
+    return { driverPosition: currentUserPoint, headingDeg: 0 };
+  }, [isNavigating, gpsStatus, liveGps, activeRoute, activeStepIdx, currentUserPoint]);
 
   const handleRoutesComputed = useCallback(
     (computed: ComputedNavRoute[], bestId: string | null) => {
@@ -408,8 +418,6 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
     setIsNavigating(false);
     setActiveStepIdx(0);
     setCameraMode('follow');
-    setLiveGpsPos(null);
-    setLiveGpsHeading(null);
   };
 
   const activeStep = activeRoute?.steps[activeStepIdx] ?? null;
@@ -439,6 +447,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
               latitude: center.latitude,
               longitude: center.longitude,
               city: center.city,
+              isGps: center.isGps,
             }}
             driverPosition={driverPosition}
             headingDeg={headingDeg}
@@ -456,9 +465,9 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
             zoomDelta={zoomDelta}
           />
 
-          {/* Live Traffic-Aware & Rain-Avoiding Route Engine */}
+          {/* Live Traffic-Aware & Rain-Avoiding Route Engine using Real Mobile GPS Origin */}
           <WazeRouteController
-            origin={originPoint}
+            origin={routeOrigin}
             destination={destination ? { lat: destination.lat, lng: destination.lng } : null}
             travelMode={travelMode}
             avoidRain={avoidRain}
@@ -470,10 +479,10 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
             onSelectRoute={setSelectedRouteId}
           />
 
-          {/* Driver Position Marker: Waze-Style Directional Arrow Puck when Routing, Clean Dot Otherwise */}
+          {/* Driver Position Marker: Live GPS Pulsing Dot or Waze Directional Arrow Puck */}
           <AdvancedMarker
             position={driverPosition}
-            title={`Tu posición · ${center.locality}`}
+            title={gpsStatus === 'active' ? 'Tu ubicación GPS en vivo' : `Tu posición · ${center.locality}`}
             zIndex={50}
           >
             {activeRoute ? (
@@ -497,22 +506,39 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                 </div>
               </div>
             ) : (
-              <div className="w-5 h-5 rounded-full bg-sky-600 border-[3px] border-white shadow-lg" />
+              <div className="relative flex items-center justify-center w-9 h-9">
+                <div
+                  className={`absolute inset-0 rounded-full ${
+                    gpsStatus === 'active'
+                      ? 'bg-sky-500/25 animate-ping'
+                      : 'bg-sky-500/15'
+                  }`}
+                />
+                <div className="relative w-5 h-5 rounded-full bg-sky-600 border-[3px] border-white shadow-lg" />
+              </div>
             )}
           </AdvancedMarker>
 
-          {/* Destination Marker */}
+          {/* Unmistakable Destination Marker ("a dónde va a ir") */}
           {destination && (
             <AdvancedMarker
               position={{ lat: destination.lat, lng: destination.lng }}
-              title={destination.name}
-              zIndex={45}
+              title={`Destino: ${destination.name}`}
+              zIndex={48}
             >
-              <div className="flex flex-col items-center -translate-y-2">
-                <div className="px-2 py-0.5 rounded-lg bg-[#0F213D] text-white text-[11px] font-bold shadow-md max-w-[140px] truncate mb-1">
+              <div className="flex flex-col items-center -translate-y-4">
+                <div className="px-2.5 py-1 rounded-xl bg-[#0F213D] text-white text-[11px] font-bold shadow-lg border border-white/20 max-w-[170px] truncate mb-1">
                   {destination.name}
                 </div>
-                <div className="w-4 h-4 rounded-full bg-rose-500 border-[3px] border-white shadow-md" />
+                <svg viewBox="0 0 32 40" className="w-8 h-10 drop-shadow-md" aria-hidden="true">
+                  <path
+                    d="M16 2C8.82 2 3 7.82 3 15c0 9.75 13 23 13 23s13-13.25 13-23C29 7.82 23.18 2 16 2z"
+                    fill="#E11D48"
+                    stroke="#FFFFFF"
+                    strokeWidth="2.5"
+                  />
+                  <circle cx="16" cy="15" r="5" fill="#FFFFFF" />
+                </svg>
               </div>
             </AdvancedMarker>
           )}
@@ -587,12 +613,16 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
           <div className="fixed top-[68px] sm:top-4 left-3.5 right-3.5 sm:left-1/2 sm:-translate-x-1/2 sm:right-auto sm:w-[360px] md:w-[400px] z-20 pointer-events-none pt-safe">
             <DestinationSearchBar
               destination={destination}
-              originCenter={originPoint}
+              originCenter={currentUserPoint}
               favorites={favorites}
               onSelectDestination={(dest) => {
                 setDestination(dest);
                 setIsNavigating(false);
                 setCameraMode('follow');
+                setRouteOrigin(currentUserPoint);
+                if (gpsStatus !== 'active' && gpsStatus !== 'manual') {
+                  onRequestGps();
+                }
               }}
               onClearDestination={handleClearRoute}
             />
@@ -661,7 +691,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
 
         {/* Quick Floating "Centrar en mí" Re-Lock Pill when user pans away from active route */}
         {activeRoute && cameraMode !== 'follow' && (
-          <div className="fixed left-3.5 bottom-[244px] sm:bottom-52 z-20">
+          <div className="fixed left-3.5 bottom-[292px] sm:bottom-64 z-20">
             <button
               type="button"
               onClick={() => {
@@ -679,7 +709,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
         {/* Right Edge Minimal Map Controls: Overview/Follow Toggle + Traffic + Zoom + Recenter */}
         <div
           className={`fixed right-3.5 z-20 flex flex-col gap-2 transition-all ${
-            destination ? 'bottom-64 sm:bottom-52' : 'bottom-28 sm:bottom-12'
+            destination ? 'bottom-[292px] sm:bottom-64' : 'bottom-28 sm:bottom-12'
           }`}
         >
           {activeRoute && (
@@ -738,14 +768,21 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
           <button
             type="button"
             onClick={() => {
+              if (gpsStatus !== 'active') {
+                onRequestGps();
+              }
               if (activeRoute) setCameraMode('follow');
               setRecenterNonce((n) => n + 1);
             }}
-            aria-label="Centrar en mi ubicación"
-            title="Centrar en mi ubicación"
-            className="w-11 h-11 rounded-2xl bg-white/92 dark:bg-slate-900/92 backdrop-blur-md border border-slate-200/80 dark:border-slate-700/80 shadow-lg flex items-center justify-center text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+            aria-label="Centrar en mi ubicación GPS"
+            title={gpsStatus === 'active' ? 'Centrar en mi GPS' : 'Activar mi GPS'}
+            className={`w-11 h-11 rounded-2xl backdrop-blur-md border shadow-lg flex items-center justify-center transition-colors ${
+              gpsStatus === 'active'
+                ? 'bg-white/92 dark:bg-slate-900/92 text-sky-600 dark:text-sky-400 border-sky-300/80 dark:border-sky-600/80 hover:bg-slate-100 dark:hover:bg-slate-800'
+                : 'bg-white/92 dark:bg-slate-900/92 text-slate-700 dark:text-slate-200 border-slate-200/80 dark:border-slate-700/80 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
           >
-            <Crosshair className="w-4 h-4" />
+            <Crosshair className={`w-4 h-4 ${gpsStatus === 'locating' ? 'animate-pulse text-sky-600' : ''}`} />
           </button>
         </div>
 
@@ -915,10 +952,34 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
               <>
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                      Desde {center.locality} hasta
-                    </p>
-                    <h2 className="text-base font-extrabold font-display text-slate-900 dark:text-white truncate">
+                    <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+                      <span
+                        className={`w-2 h-2 rounded-full shrink-0 ${
+                          gpsStatus === 'active'
+                            ? 'bg-emerald-500'
+                            : gpsStatus === 'locating'
+                              ? 'bg-sky-500 animate-pulse'
+                              : 'bg-amber-500'
+                        }`}
+                      />
+                      <span className="truncate">
+                        {gpsStatus === 'active'
+                          ? `Desde tu ubicación GPS (${center.locality})`
+                          : gpsStatus === 'locating'
+                            ? 'Obteniendo tu ubicación GPS...'
+                            : `Desde ${center.locality}`}
+                      </span>
+                      {gpsStatus !== 'active' && (
+                        <button
+                          type="button"
+                          onClick={onRequestGps}
+                          className="ml-1 text-[11px] font-bold text-violet-700 dark:text-violet-400 underline shrink-0"
+                        >
+                          Usar mi GPS
+                        </button>
+                      )}
+                    </div>
+                    <h2 className="text-base font-extrabold font-display text-slate-900 dark:text-white truncate mt-0.5">
                       {destination.name}
                     </h2>
                   </div>
