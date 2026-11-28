@@ -187,12 +187,27 @@ export async function fetchLiveSabBogotaStations(
   });
 }
 
+const MAX_KMZ_BYTES = 10 * 1024 * 1024;
+const MAX_ZIP_ENTRY_BYTES = 5 * 1024 * 1024;
+const MAX_TOTAL_EXTRACTED_BYTES = 12 * 1024 * 1024;
+const MAX_ZIP_ENTRIES = 64;
+
+function isSafeZipEntryName(fileName: string): boolean {
+  if (!fileName || fileName.length > 255) return false;
+  if (fileName.includes('\0') || fileName.startsWith('/') || fileName.startsWith('\\')) return false;
+  const normalized = fileName.replace(/\\/g, '/');
+  if (normalized.split('/').some((segment) => segment === '..')) return false;
+  return true;
+}
+
 /**
  * Minimal pure-Node ZIP extractor for KMZ files using Central Directory records.
- * Supports compression method 0 (stored) and 8 (deflate).
+ * Supports compression method 0 (stored) and 8 (deflate) with strict decompression limits.
  */
 export function extractZipEntries(zipBuf: Buffer): Map<string, Buffer> {
   const entries = new Map<string, Buffer>();
+  if (zipBuf.length < 22 || zipBuf.length > MAX_KMZ_BYTES) return entries;
+
   // Locate End of Central Directory (EOCD) signature 0x06054b50
   let eocdOffset = -1;
   const minOffset = Math.max(0, zipBuf.length - 65557);
@@ -204,10 +219,12 @@ export function extractZipEntries(zipBuf: Buffer): Map<string, Buffer> {
   }
   if (eocdOffset === -1) return entries;
 
-  const totalEntries = zipBuf.readUInt16LE(eocdOffset + 10);
+  const totalEntries = Math.min(zipBuf.readUInt16LE(eocdOffset + 10), MAX_ZIP_ENTRIES);
   const cdOffset = zipBuf.readUInt32LE(eocdOffset + 16);
 
   let cursor = cdOffset;
+  let totalExtracted = 0;
+
   for (let i = 0; i < totalEntries && cursor + 46 <= zipBuf.length; i++) {
     if (zipBuf.readUInt32LE(cursor) !== 0x02014b50) break;
     const method = zipBuf.readUInt16LE(cursor + 10);
@@ -217,11 +234,14 @@ export function extractZipEntries(zipBuf: Buffer): Map<string, Buffer> {
     const extraLen = zipBuf.readUInt16LE(cursor + 30);
     const commentLen = zipBuf.readUInt16LE(cursor + 32);
     const localHeaderOffset = zipBuf.readUInt32LE(cursor + 42);
+    if (cursor + 46 + nameLen > zipBuf.length) break;
     const fileName = zipBuf.subarray(cursor + 46, cursor + 46 + nameLen).toString('utf8');
     cursor += 46 + nameLen + extraLen + commentLen;
 
-    // Guard against zip bombs (cap extracted entry size at 5 MB)
-    if (uncompSize > 5 * 1024 * 1024 || compSize > 5 * 1024 * 1024) continue;
+    if (!isSafeZipEntryName(fileName)) continue;
+
+    // Guard against zip bombs (both declared header sizes AND actual inflated output length)
+    if (uncompSize > MAX_ZIP_ENTRY_BYTES || compSize > MAX_ZIP_ENTRY_BYTES) continue;
     if (localHeaderOffset + 30 > zipBuf.length) continue;
     if (zipBuf.readUInt32LE(localHeaderOffset) !== 0x04034b50) continue;
 
@@ -233,20 +253,38 @@ export function extractZipEntries(zipBuf: Buffer): Map<string, Buffer> {
 
     const rawSlice = zipBuf.subarray(dataStart, dataEnd);
     try {
+      let extracted: Buffer | null = null;
       if (method === 0) {
-        entries.set(fileName, Buffer.from(rawSlice));
+        if (rawSlice.length > MAX_ZIP_ENTRY_BYTES) continue;
+        extracted = Buffer.from(rawSlice);
       } else if (method === 8) {
-        entries.set(fileName, zlib.inflateRawSync(rawSlice));
+        extracted = zlib.inflateRawSync(rawSlice, { maxOutputLength: MAX_ZIP_ENTRY_BYTES });
+      }
+      if (extracted) {
+        if (totalExtracted + extracted.length > MAX_TOTAL_EXTRACTED_BYTES) break;
+        totalExtracted += extracted.length;
+        entries.set(fileName, extracted);
       }
     } catch {
-      // Skip malformed entry
+      // Skip malformed or oversized compressed entry (e.g. forged header zip bomb)
     }
   }
   return entries;
 }
 
-function extractXmlTag(xml: string, tag: string): string | null {
-  const match = new RegExp(`<${tag}>([^<]+)</${tag}>`, 'i').exec(xml);
+const KML_TAG_REGEXES = {
+  href: /<href>([^<]+)<\/href>/i,
+  north: /<north>([^<]+)<\/north>/i,
+  south: /<south>([^<]+)<\/south>/i,
+  east: /<east>([^<]+)<\/east>/i,
+  west: /<west>([^<]+)<\/west>/i,
+  name: /<name>([^<]+)<\/name>/i,
+} as const;
+
+type AllowedKmlTag = keyof typeof KML_TAG_REGEXES;
+
+function extractXmlTag(xml: string, tag: AllowedKmlTag): string | null {
+  const match = KML_TAG_REGEXES[tag].exec(xml);
   return match ? match[1].trim() : null;
 }
 
@@ -261,7 +299,14 @@ export async function fetchIdigerRadarKmz(): Promise<{
   try {
     const resp = await fetchWithTimeout(IDIGER_RADAR_KMZ_URL, 6500);
     if (!resp.ok) return idigerRadarCache?.data ?? null;
+    const contentLength = Number(resp.headers.get('content-length') ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > MAX_KMZ_BYTES) {
+      return idigerRadarCache?.data ?? null;
+    }
     const arrayBuf = await resp.arrayBuffer();
+    if (arrayBuf.byteLength > MAX_KMZ_BYTES) {
+      return idigerRadarCache?.data ?? null;
+    }
     const entries = extractZipEntries(Buffer.from(arrayBuf));
 
     const kmlEntry = Array.from(entries.entries()).find(([name]) =>

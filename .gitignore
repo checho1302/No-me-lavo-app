@@ -9,3 +9,5 @@ coverage/
 .gmp_cache/
 .playwright-cli/
 .nomelavo-data/
+.pluvia-data/
+dev-dist/

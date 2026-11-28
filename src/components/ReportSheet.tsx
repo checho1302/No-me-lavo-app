@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Camera, CheckCircle2, CloudRain, Shield, X } from 'lucide-react';
 import type { CitizenReport, LocalityOption } from '../types/weather';
-import { validateCitizenReportInput } from '../utils/weatherLogic';
+import { isSafeReportPhotoDataUrl, validateCitizenReportInput } from '../utils/weatherLogic';
 
 interface ReportSheetProps {
   open: boolean;
@@ -63,9 +63,12 @@ export const ReportSheet: React.FC<ReportSheetProps> = ({
     }
     const reader = new FileReader();
     reader.onload = () => {
-      if (typeof reader.result === 'string') {
+      if (isSafeReportPhotoDataUrl(reader.result)) {
         setPhotoDataUrl(reader.result);
         setError(null);
+      } else {
+        setPhotoDataUrl(null);
+        setError('Solo se admiten imágenes PNG, JPG o WEBP válidas.');
       }
     };
     reader.readAsDataURL(file);
@@ -203,7 +206,7 @@ export const ReportSheet: React.FC<ReportSheetProps> = ({
               </div>
             </div>
 
-            {photoDataUrl && (
+            {isSafeReportPhotoDataUrl(photoDataUrl) && (
               <div className="relative w-32 h-24 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700">
                 <img src={photoDataUrl} alt="Vista previa de reporte ciudadano" className="w-full h-full object-cover" />
                 <button
@@ -285,7 +288,7 @@ export const ReportSheet: React.FC<ReportSheetProps> = ({
                     </span>
                   </div>
                   <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed">{rep.description}</p>
-                  {rep.photoDataUrl && (
+                  {isSafeReportPhotoDataUrl(rep.photoDataUrl) && (
                     <img
                       src={rep.photoDataUrl}
                       alt={`Evidencia de ${labelForType(rep.type)} en ${rep.locality}`}

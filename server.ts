@@ -30,6 +30,10 @@ import {
   describeWeatherCode,
   evaluateAlertRules,
   fuzzCoordinates,
+  isSafeReportPhotoDataUrl,
+  isValidEntityId,
+  sanitizeRainViewerHost,
+  sanitizeRainViewerTileUrl,
   validateAlertRuleInput,
   validateCitizenReportInput,
 } from './src/utils/weatherLogic.ts';
@@ -37,26 +41,84 @@ import {
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-// Lightweight TTL cache to separate external ingestion from mobile API reads
+// Lightweight bounded TTL cache to separate external ingestion from mobile API reads
 interface CacheEntry<T> {
   data: T;
   expiresAt: number;
 }
+const MAX_WEATHER_CACHE_ENTRIES = 200;
 const weatherCache = new Map<string, CacheEntry<OpenMeteoPayload>>();
 let radarCache: CacheEntry<RadarProductsResponse> | null = null;
 
-// In-memory rate limiting for write endpoints
+// Bounded in-memory rate limiting for write endpoints
+const MAX_RATE_LIMIT_IPS = 2000;
 const writeHits = new Map<string, { count: number; resetAt: number }>();
 function checkRateLimit(ip: string, limit = 40, windowMs = 60_000): boolean {
   const now = Date.now();
+  if (writeHits.size > 500) {
+    for (const [key, val] of writeHits) {
+      if (now > val.resetAt) writeHits.delete(key);
+    }
+  }
   const entry = writeHits.get(ip);
   if (!entry || now > entry.resetAt) {
+    if (writeHits.size >= MAX_RATE_LIMIT_IPS) {
+      const oldestKey = writeHits.keys().next().value;
+      if (oldestKey) writeHits.delete(oldestKey);
+    }
     writeHits.set(ip, { count: 1, resetAt: now + windowMs });
     return true;
   }
   if (entry.count >= limit) return false;
   entry.count += 1;
   return true;
+}
+
+const ALLOWED_PUSH_PLATFORMS = new Set(['web-pwa', 'android', 'ios']);
+
+function requireSafeOrigin(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  const secFetchSite = req.headers['sec-fetch-site'];
+  if (typeof secFetchSite === 'string' && secFetchSite.toLowerCase() === 'cross-site') {
+    res.status(403).json({ error: 'Solicitud de origen cruzado bloqueada.' });
+    return;
+  }
+
+  const originHeader = req.headers.origin;
+  if (typeof originHeader === 'string' && originHeader.trim() !== '') {
+    try {
+      const originHost = new URL(originHeader).host.toLowerCase();
+      const allowedHosts = new Set(
+        [req.headers.host, req.headers['x-forwarded-host']]
+          .flatMap((h) => (typeof h === 'string' ? h.split(',') : []))
+          .map((h) => h.trim().toLowerCase())
+          .filter(Boolean)
+      );
+      if (allowedHosts.size > 0 && !allowedHosts.has(originHost)) {
+        res.status(403).json({ error: 'Origen no autorizado.' });
+        return;
+      }
+    } catch {
+      res.status(403).json({ error: 'Encabezado de origen inválido.' });
+      return;
+    }
+  }
+  next();
+}
+
+function rateLimitWrites(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  if (!checkRateLimit(req.ip ?? 'local')) {
+    res.status(429).json({ error: 'Demasiadas solicitudes. Intenta en un minuto.' });
+    return;
+  }
+  next();
 }
 
 // Persistent JSON store in local app data directory (safe path confined)
@@ -139,7 +201,12 @@ function loadStore(): PersistedStore {
       const raw = fs.readFileSync(STORE_PATH, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<PersistedStore>;
       return {
-        reports: Array.isArray(parsed.reports) ? parsed.reports : DEFAULT_STORE.reports,
+        reports: Array.isArray(parsed.reports)
+          ? parsed.reports.map((rep) => ({
+              ...rep,
+              photoDataUrl: isSafeReportPhotoDataUrl(rep?.photoDataUrl) ? rep.photoDataUrl : null,
+            }))
+          : DEFAULT_STORE.reports,
         alertRules: Array.isArray(parsed.alertRules) ? parsed.alertRules : DEFAULT_STORE.alertRules,
         favorites: Array.isArray(parsed.favorites) ? parsed.favorites : DEFAULT_STORE.favorites,
         pushTokens: Array.isArray(parsed.pushTokens) ? parsed.pushTokens : [],
@@ -258,6 +325,10 @@ async function fetchOpenMeteo(latitude: number, longitude: number): Promise<Open
       fetchedAt: new Date().toISOString(),
       source: 'Open-Meteo · Modelo atmosférico en vivo',
     };
+    if (weatherCache.size >= MAX_WEATHER_CACHE_ENTRIES) {
+      const oldestKey = weatherCache.keys().next().value;
+      if (oldestKey) weatherCache.delete(oldestKey);
+    }
     weatherCache.set(cacheKey, { data: payload, expiresAt: Date.now() + 5 * 60_000 });
     return payload;
   } catch {
@@ -442,7 +513,7 @@ async function fetchRadarProducts(): Promise<RadarProductsResponse> {
       };
     };
 
-    const host = json.host || 'https://tilecache.rainviewer.com';
+    const host = sanitizeRainViewerHost(json.host);
     const past = (json.radar?.past ?? []).slice(-8);
     const nowcast = (json.radar?.nowcast ?? []).slice(0, 3);
 
@@ -457,21 +528,28 @@ async function fetchRadarProducts(): Promise<RadarProductsResponse> {
       return isForecast ? `${hm} (est.)` : hm;
     };
 
+    const buildSafeFrame = (
+      f: { time: number; path: string },
+      isForecast: boolean
+    ): RadarFrame | null => {
+      const tileUrlTemplate = sanitizeRainViewerTileUrl(host, f.path, 6);
+      if (!tileUrlTemplate || !Number.isFinite(f.time)) return null;
+      return {
+        time: f.time,
+        path: f.path,
+        tileUrlTemplate,
+        isForecast,
+        label: formatTimeLabel(f.time, isForecast),
+      };
+    };
+
     const frames: RadarFrame[] = [
-      ...past.map((f) => ({
-        time: f.time,
-        path: f.path,
-        tileUrlTemplate: `${host}${f.path}/256/{z}/{x}/{y}/6/1_1.png`,
-        isForecast: false,
-        label: formatTimeLabel(f.time, false),
-      })),
-      ...nowcast.map((f) => ({
-        time: f.time,
-        path: f.path,
-        tileUrlTemplate: `${host}${f.path}/256/{z}/{x}/{y}/6/1_1.png`,
-        isForecast: true,
-        label: formatTimeLabel(f.time, true),
-      })),
+      ...past
+        .map((f) => buildSafeFrame(f, false))
+        .filter((f): f is RadarFrame => f !== null),
+      ...nowcast
+        .map((f) => buildSafeFrame(f, true))
+        .filter((f): f is RadarFrame => f !== null),
     ];
 
     const idigerKmz = await fetchIdigerRadarKmz();
@@ -539,7 +617,26 @@ async function getCombinedStations(
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.disable('x-powered-by');
+
+  // Security headers (preserve iframe embedding for preview environments)
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'geolocation=(self), camera=(), microphone=()');
+    next();
+  });
+
+  // Tighten JSON body size limits: 2 MB only for citizen reports with optional photos, 64 KB elsewhere
+  const smallJsonParser = express.json({ limit: '64kb' });
+  const reportJsonParser = express.json({ limit: '2mb' });
+  app.use((req, res, next) => {
+    if (req.path === '/api/v1/reports' && req.method === 'POST') {
+      reportJsonParser(req, res, next);
+      return;
+    }
+    smallJsonParser(req, res, next);
+  });
 
   // --- API v1 Routes (No me lavo app) ---
 
@@ -700,6 +797,10 @@ async function startServer() {
 
   app.get('/api/v1/stations/:id/observations', async (req, res) => {
     const reqId = req.params.id;
+    if (!isValidEntityId(reqId)) {
+      res.status(400).json({ error: 'Identificador de estación inválido.' });
+      return;
+    }
     const allSab = await fetchLiveSabBogotaStations({ latitude: 4.6486, longitude: -74.0628 });
     const sabMatch = allSab.find((s) => s.id === reqId);
     const catalogMatch = STATION_CATALOG.find((s) => s.id === reqId);
@@ -768,7 +869,7 @@ async function startServer() {
     });
   });
 
-  app.get('/api/v1/maps-config', (_req, res) => {
+  app.get('/api/v1/maps-config', requireSafeOrigin, (_req, res) => {
     const rawKey = (
       process.env.VITE_GOOGLE_MAPS_API_KEY ||
       process.env.GOOGLE_MAPS_API_KEY ||
@@ -925,11 +1026,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/alerts/rules', (req, res) => {
-    if (!checkRateLimit(req.ip ?? 'local')) {
-      res.status(429).json({ error: 'Demasiadas solicitudes. Intenta en un minuto.' });
-      return;
-    }
+  app.post('/api/v1/alerts/rules', requireSafeOrigin, rateLimitWrites, (req, res) => {
     const { name, locality, latitude, longitude, radiusKm, thresholdMmH } = req.body ?? {};
     const check = validateAlertRuleInput({ name, locality, radiusKm, thresholdMmH });
     if (!check.valid) {
@@ -957,7 +1054,11 @@ async function startServer() {
     res.status(201).json({ rule: newRule });
   });
 
-  app.patch('/api/v1/alerts/rules/:id', (req, res) => {
+  app.patch('/api/v1/alerts/rules/:id', requireSafeOrigin, rateLimitWrites, (req, res) => {
+    if (!isValidEntityId(req.params.id)) {
+      res.status(400).json({ error: 'Identificador de regla inválido.' });
+      return;
+    }
     const idx = store.alertRules.findIndex((r) => r.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Regla no encontrada.' });
@@ -969,7 +1070,11 @@ async function startServer() {
     res.json({ rule: store.alertRules[idx] });
   });
 
-  app.delete('/api/v1/alerts/rules/:id', (req, res) => {
+  app.delete('/api/v1/alerts/rules/:id', requireSafeOrigin, rateLimitWrites, (req, res) => {
+    if (!isValidEntityId(req.params.id)) {
+      res.status(400).json({ error: 'Identificador de regla inválido.' });
+      return;
+    }
     const before = store.alertRules.length;
     store.alertRules = store.alertRules.filter((r) => r.id !== req.params.id);
     if (store.alertRules.length === before) {
@@ -987,11 +1092,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/reports', (req, res) => {
-    if (!checkRateLimit(req.ip ?? 'local')) {
-      res.status(429).json({ error: 'Demasiadas solicitudes. Intenta en un minuto.' });
-      return;
-    }
+  app.post('/api/v1/reports', requireSafeOrigin, rateLimitWrites, (req, res) => {
     const { type, description, locality, latitude, longitude, protectLocation = true, photoDataUrl = null } =
       req.body ?? {};
     const check = validateCitizenReportInput({ type, description, locality, photoDataUrl });
@@ -1014,7 +1115,7 @@ async function startServer() {
       latitude: finalCoords.latitude,
       longitude: finalCoords.longitude,
       locationProtected: Boolean(protectLocation),
-      photoDataUrl: typeof photoDataUrl === 'string' && photoDataUrl.length > 0 ? photoDataUrl : null,
+      photoDataUrl: isSafeReportPhotoDataUrl(photoDataUrl) ? photoDataUrl : null,
       moderationStatus: 'en_revision',
       createdAt: new Date().toISOString(),
     };
@@ -1024,16 +1125,20 @@ async function startServer() {
     res.status(201).json({ report: newReport });
   });
 
-  app.post('/api/v1/push-tokens', (req, res) => {
+  app.post('/api/v1/push-tokens', requireSafeOrigin, rateLimitWrites, (req, res) => {
     const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
-    const platform = typeof req.body?.platform === 'string' ? req.body.platform.trim() : 'web-pwa';
-    if (token.length < 8 || token.length > 256) {
+    const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform.trim() : 'web-pwa';
+    if (token.length < 8 || token.length > 256 || !/^[\x21-\x7E]+$/.test(token)) {
       res.status(400).json({ error: 'Token de notificación inválido.' });
+      return;
+    }
+    if (!ALLOWED_PUSH_PLATFORMS.has(rawPlatform)) {
+      res.status(400).json({ error: 'Plataforma de notificación no permitida.' });
       return;
     }
     const updatedAt = new Date().toISOString();
     store.pushTokens = [
-      { token, platform, updatedAt },
+      { token, platform: rawPlatform, updatedAt },
       ...store.pushTokens.filter((t) => t.token !== token),
     ].slice(0, 20);
     saveStore(store);
@@ -1044,12 +1149,22 @@ async function startServer() {
     res.json({ favorites: store.favorites });
   });
 
-  app.post('/api/v1/locations/favorites', (req, res) => {
+  app.post('/api/v1/locations/favorites', requireSafeOrigin, rateLimitWrites, (req, res) => {
     const { label, locality, city, latitude, longitude } = req.body ?? {};
     if (typeof label !== 'string' || label.trim().length < 2 || label.trim().length > 50) {
       res.status(400).json({ error: 'Etiqueta de ubicación inválida.' });
       return;
     }
+    const trimmedLabel = label.trim();
+    const trimmedLocality =
+      typeof locality === 'string' && locality.trim() ? locality.trim() : trimmedLabel;
+    const trimmedCity = typeof city === 'string' && city.trim() ? city.trim() : 'Bogotá';
+
+    if (trimmedLocality.length > 80 || trimmedCity.length > 80) {
+      res.status(400).json({ error: 'Localidad o ciudad demasiado larga (máximo 80 caracteres).' });
+      return;
+    }
+
     const lat = parseCoordinate(latitude, -90, 90, 4.6486);
     const lon = parseCoordinate(longitude, -180, 180, -74.0628);
 
@@ -1063,9 +1178,9 @@ async function startServer() {
 
     const fav: FavoriteLocation = {
       id: `fav-${crypto.randomUUID().slice(0, 8)}`,
-      label: label.trim(),
-      locality: typeof locality === 'string' && locality.trim() ? locality.trim() : label.trim(),
-      city: typeof city === 'string' && city.trim() ? city.trim() : 'Bogotá',
+      label: trimmedLabel,
+      locality: trimmedLocality,
+      city: trimmedCity,
       latitude: lat,
       longitude: lon,
       createdAt: new Date().toISOString(),
@@ -1076,7 +1191,11 @@ async function startServer() {
     res.status(201).json({ favorite: fav });
   });
 
-  app.delete('/api/v1/locations/favorites/:id', (req, res) => {
+  app.delete('/api/v1/locations/favorites/:id', requireSafeOrigin, rateLimitWrites, (req, res) => {
+    if (!isValidEntityId(req.params.id)) {
+      res.status(400).json({ error: 'Identificador de ubicación inválido.' });
+      return;
+    }
     store.favorites = store.favorites.filter((f) => f.id !== req.params.id);
     saveStore(store);
     res.json({ deleted: true });
@@ -1097,6 +1216,30 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
+
+  // Centralized error handler: return clean JSON without leaking stack traces
+  app.use(
+    (
+      err: { status?: number; type?: string },
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (res.headersSent) {
+        next(err);
+        return;
+      }
+      if (err?.type === 'entity.too.large' || err?.status === 413) {
+        res.status(413).json({ error: 'El contenido enviado excede el tamaño máximo permitido.' });
+        return;
+      }
+      if (err?.type === 'entity.parse.failed' || err?.status === 400) {
+        res.status(400).json({ error: 'El cuerpo JSON de la solicitud no es válido.' });
+        return;
+      }
+      res.status(500).json({ error: 'Error interno del servidor.' });
+    }
+  );
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`No me lavo app server listening on http://localhost:${PORT}`);

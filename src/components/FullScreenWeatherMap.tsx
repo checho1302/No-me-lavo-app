@@ -183,10 +183,15 @@ export const FullScreenWeatherMap: React.FC<FullScreenWeatherMapProps> = ({
     if (!showRadar) return;
 
     const useIdigerLive = isBogota && radarMode === 'idiger' && radar?.idigerRadar?.available;
-    if (useIdigerLive && radar?.idigerRadar) {
+    if (
+      useIdigerLive &&
+      radar?.idigerRadar &&
+      radar.idigerRadar.imageUrl.startsWith('/api/v1/radar/idiger/image')
+    ) {
       const { north, south, east, west } = radar.idigerRadar.bounds;
       const cacheKey = radar.idigerRadar.observedAt ?? radar.generatedAt;
-      const imageUrl = `${radar.idigerRadar.imageUrl}?t=${encodeURIComponent(cacheKey)}`;
+      const sep = radar.idigerRadar.imageUrl.includes('?') ? '&' : '?';
+      const imageUrl = `${radar.idigerRadar.imageUrl}${sep}t=${encodeURIComponent(cacheKey)}`;
       idigerOverlayRef.current = L.imageOverlay(
         imageUrl,
         [

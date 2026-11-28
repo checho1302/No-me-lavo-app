@@ -1,14 +1,19 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useMap, useMapsLibrary } from '@vis.gl/react-google-maps';
 import type { WeatherStation } from '../types/weather';
 import {
+  analyzeRouteTraffic,
   computeDryBypassWaypoint,
-  computeTrafficDelayMin,
   evaluateRouteRainExposure,
   extractRainZones,
+  normalizeManeuver,
+  parseStepBannerDisplay,
   rankRoutes,
   type LatLngPoint,
+  type NavManeuverType,
   type RainZone,
+  type RouteSpeedSegment,
+  type RouteTrafficSummary,
   type RouteWeatherEvaluation,
 } from '../utils/routeWeatherLogic';
 
@@ -16,8 +21,15 @@ export type NavTravelMode = 'DRIVING' | 'TWO_WHEELER' | 'BICYCLING' | 'WALKING';
 
 export interface NavStep {
   instruction: string;
+  maneuver: NavManeuverType;
+  bannerPrefix: string;
+  primaryRoad: string;
+  currentRoad: string;
+  actionShort: string;
   distanceMeters: number;
+  durationMillis: number;
   startLocation: LatLngPoint | null;
+  path: LatLngPoint[];
 }
 
 export interface ComputedNavRoute {
@@ -26,7 +38,11 @@ export interface ComputedNavRoute {
   distanceMeters: number;
   durationMillis: number;
   staticDurationMillis: number;
+  localizedDuration: string | null;
   trafficDelayMin: number;
+  traffic: RouteTrafficSummary;
+  speedSegments: RouteSpeedSegment[];
+  trafficUpdatedAt: number;
   weather: RouteWeatherEvaluation;
   isBypassDetour: boolean;
   path: LatLngPoint[];
@@ -39,9 +55,11 @@ interface WazeRouteControllerProps {
   destination: LatLngPoint | null;
   travelMode: NavTravelMode;
   avoidRain: boolean;
+  showTraffic: boolean;
   stations: WeatherStation[];
   selectedRouteId: string | null;
-  onRoutesComputed: (routes: ComputedNavRoute[], activeId: string | null) => void;
+  trafficRefreshNonce: number;
+  onRoutesComputed: (routes: ComputedNavRoute[], activeId: string | null, isBackgroundRefresh?: boolean) => void;
   onRouteLoading: (loading: boolean) => void;
   onRouteError: (error: string | null) => void;
   onSelectRoute: (routeId: string) => void;
@@ -57,59 +75,64 @@ function isQuotaError(err: unknown): boolean {
   );
 }
 
+function toLatLngPoint(p: any): LatLngPoint | null {
+  if (!p) return null;
+  if (typeof p.lat === 'function' && typeof p.lng === 'function') {
+    return { lat: p.lat(), lng: p.lng() };
+  }
+  if (typeof p.lat === 'number' && typeof p.lng === 'number') {
+    return { lat: p.lat, lng: p.lng };
+  }
+  return null;
+}
+
 // Safely extracts plain LatLngPoint array from Routes JS SDK route object
 function extractPathPoints(rawRoute: any): LatLngPoint[] {
   const pts: LatLngPoint[] = [];
   if (Array.isArray(rawRoute?.path) && rawRoute.path.length > 0) {
     for (const p of rawRoute.path) {
-      if (typeof p?.lat === 'function' && typeof p?.lng === 'function') {
-        pts.push({ lat: p.lat(), lng: p.lng() });
-      } else if (typeof p?.lat === 'number' && typeof p?.lng === 'number') {
-        pts.push({ lat: p.lat, lng: p.lng });
-      }
+      const pt = toLatLngPoint(p);
+      if (pt) pts.push(pt);
     }
     if (pts.length > 0) return pts;
   }
 
-  // Fallback: collect points from legs/steps if path is nested
+  // Fallback: collect points from legs if top-level path is absent
   const legs = Array.isArray(rawRoute?.legs) ? rawRoute.legs : [];
   for (const leg of legs) {
     if (Array.isArray(leg?.path)) {
       for (const p of leg.path) {
-        if (typeof p?.lat === 'function') pts.push({ lat: p.lat(), lng: p.lng() });
-        else if (typeof p?.lat === 'number') pts.push({ lat: p.lat, lng: p.lng });
+        const pt = toLatLngPoint(p);
+        if (pt) pts.push(pt);
       }
     }
   }
   return pts;
 }
 
-function extractNavSteps(rawRoute: any): NavStep[] {
-  const steps: NavStep[] = [];
-  const legs = Array.isArray(rawRoute?.legs) ? rawRoute.legs : [];
-  for (const leg of legs) {
-    const rawSteps = Array.isArray(leg?.steps) ? leg.steps : [];
-    for (const st of rawSteps) {
-      const text =
-        st?.instructions ||
-        st?.navigationInstruction?.instructions ||
-        'Continúa por la vía principal';
-      const dist = Number(st?.distanceMeters ?? 0);
-      const start = st?.startLocation;
-      let startLoc: LatLngPoint | null = null;
-      if (start && typeof start.lat === 'function' && typeof start.lng === 'function') {
-        startLoc = { lat: start.lat(), lng: start.lng() };
-      } else if (start && typeof start.lat === 'number' && typeof start.lng === 'number') {
-        startLoc = { lat: start.lat, lng: start.lng };
+function extractSpeedSegments(rawRoute: any): RouteSpeedSegment[] {
+  const segments: RouteSpeedSegment[] = [];
+  const rawSpeedPaths = Array.isArray(rawRoute?.speedPaths) ? rawRoute.speedPaths : [];
+  for (const sp of rawSpeedPaths) {
+    const speedRaw = String(sp?.speed ?? 'NORMAL').toUpperCase();
+    const speed: RouteSpeedSegment['speed'] =
+      speedRaw === 'TRAFFIC_JAM'
+        ? 'TRAFFIC_JAM'
+        : speedRaw === 'SLOW'
+          ? 'SLOW'
+          : 'NORMAL';
+    const path: LatLngPoint[] = [];
+    if (Array.isArray(sp?.path)) {
+      for (const p of sp.path) {
+        const pt = toLatLngPoint(p);
+        if (pt) path.push(pt);
       }
-      steps.push({
-        instruction: String(text),
-        distanceMeters: dist,
-        startLocation: startLoc,
-      });
+    }
+    if (path.length >= 2) {
+      segments.push({ speed, path });
     }
   }
-  return steps;
+  return segments;
 }
 
 function parseDurationMs(val: unknown): number {
@@ -121,13 +144,76 @@ function parseDurationMs(val: unknown): number {
   return 0;
 }
 
+function extractNavSteps(rawRoute: any, fallbackRoad = ''): NavStep[] {
+  const steps: NavStep[] = [];
+  const legs = Array.isArray(rawRoute?.legs) ? rawRoute.legs : [];
+  let runningRoad = fallbackRoad;
+
+  for (const leg of legs) {
+    const rawSteps = Array.isArray(leg?.steps) ? leg.steps : [];
+    for (const st of rawSteps) {
+      const text = String(
+        st?.instructions ||
+          st?.navigationInstruction?.instructions ||
+          'Continúa por la vía principal'
+      );
+      const rawManeuver = st?.maneuver ?? st?.navigationInstruction?.maneuver;
+      const maneuver = normalizeManeuver(rawManeuver, text);
+      const banner = parseStepBannerDisplay({ instruction: text, maneuver }, runningRoad || fallbackRoad);
+      if (banner.currentRoad) {
+        runningRoad = banner.currentRoad;
+      }
+
+      const dist = Number(st?.distanceMeters ?? 0);
+      const dur = parseDurationMs(
+        st?.durationMillis ?? st?.duration ?? st?.staticDurationMillis ?? st?.staticDuration
+      );
+
+      const stepPath: LatLngPoint[] = [];
+      if (Array.isArray(st?.path)) {
+        for (const p of st.path) {
+          const pt = toLatLngPoint(p);
+          if (pt) stepPath.push(pt);
+        }
+      }
+
+      steps.push({
+        instruction: text,
+        maneuver,
+        bannerPrefix: banner.prefix,
+        primaryRoad: banner.primaryRoad,
+        currentRoad: banner.currentRoad,
+        actionShort: banner.actionShort,
+        distanceMeters: dist,
+        durationMillis: dur,
+        startLocation: toLatLngPoint(st?.startLocation) ?? stepPath[0] ?? null,
+        path: stepPath,
+      });
+    }
+  }
+  return steps;
+}
+
+function sumLegsDurationMs(rawRoute: any, field: 'durationMillis' | 'staticDurationMillis'): number {
+  const legs = Array.isArray(rawRoute?.legs) ? rawRoute.legs : [];
+  let sum = 0;
+  for (const leg of legs) {
+    sum += parseDurationMs(leg?.[field]);
+  }
+  return sum;
+}
+
+const LIVE_TRAFFIC_REFRESH_INTERVAL_MS = 60_000;
+
 export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
   origin,
   destination,
   travelMode,
   avoidRain,
+  showTraffic,
   stations,
   selectedRouteId,
+  trafficRefreshNonce,
   onRoutesComputed,
   onRouteLoading,
   onRouteError,
@@ -138,6 +224,13 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
   const polylinesRef = useRef<google.maps.Polyline[]>([]);
   const rainCirclesRef = useRef<google.maps.Circle[]>([]);
   const computedRoutesRef = useRef<ComputedNavRoute[]>([]);
+  const selectedRouteIdRef = useRef<string | null>(selectedRouteId);
+  const autoTickRef = useRef<number | null>(null);
+  const [drawVersion, setDrawVersion] = useState(0);
+
+  useEffect(() => {
+    selectedRouteIdRef.current = selectedRouteId;
+  }, [selectedRouteId]);
 
   const clearDrawn = () => {
     polylinesRef.current.forEach((p) => p.setMap(null));
@@ -146,42 +239,56 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
     rainCirclesRef.current = [];
   };
 
-  // Compute live traffic-aware routes + automatic dry bypass detour when needed
+  // Compute real-time TRAFFIC_AWARE_OPTIMAL routes + live speedPaths + 60s auto-refresh
   useEffect(() => {
+    if (autoTickRef.current !== null) {
+      window.clearInterval(autoTickRef.current);
+      autoTickRef.current = null;
+    }
+
     if (!map || !routesLib || !destination) {
       clearDrawn();
       computedRoutesRef.current = [];
-      onRoutesComputed([], null);
+      onRoutesComputed([], null, false);
       onRouteError(null);
       return;
     }
 
     let cancelled = false;
-    onRouteLoading(true);
-    onRouteError(null);
-
+    const supportsLiveTraffic = travelMode === 'DRIVING' || travelMode === 'TWO_WHEELER';
     const rainZones: RainZone[] = extractRainZones(stations);
     const RouteClass = (routesLib as unknown as { Route: any }).Route;
 
+    // Official Google Routes API JS SDK:
+    // - TRAFFIC_AWARE_OPTIMAL gives Google Maps app-grade real-time traffic ETA
+    // - Omitting departureTime uses Google's live real-time traffic clock now without clock-skew errors
+    // - TRAFFIC_ON_POLYLINE + speedPaths returns exact NORMAL/SLOW/TRAFFIC_JAM segments on the route
     const buildRequest = (intermediates?: Array<{ location: LatLngPoint; via: boolean }>) => {
+      const fields = [
+        'path',
+        'distanceMeters',
+        'durationMillis',
+        'staticDurationMillis',
+        'localizedValues',
+        'viewport',
+        'legs',
+        'description',
+      ];
+      if (supportsLiveTraffic) {
+        fields.push('speedPaths', 'travelAdvisory');
+      }
+
       const req: Record<string, unknown> = {
         origin,
         destination,
         travelMode,
         computeAlternativeRoutes: !intermediates,
-        fields: [
-          'path',
-          'distanceMeters',
-          'durationMillis',
-          'staticDurationMillis',
-          'viewport',
-          'legs',
-          'description',
-        ],
+        fields,
       };
 
-      if (travelMode === 'DRIVING' || travelMode === 'TWO_WHEELER') {
-        req.routingPreference = 'TRAFFIC_AWARE';
+      if (supportsLiveTraffic) {
+        req.routingPreference = 'TRAFFIC_AWARE_OPTIMAL';
+        req.extraComputations = ['TRAFFIC_ON_POLYLINE'];
       }
       if (intermediates && intermediates.length > 0) {
         req.intermediates = intermediates;
@@ -189,48 +296,87 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
       return req;
     };
 
-    const normalizeRoute = (raw: any, id: string, isBypassDetour: boolean): ComputedNavRoute => {
+    const normalizeRoute = (
+      raw: any,
+      id: string,
+      isBypassDetour: boolean,
+      updatedAt: number
+    ): ComputedNavRoute => {
       const path = extractPathPoints(raw);
-      const durationMillis = parseDurationMs(raw?.durationMillis ?? raw?.duration);
-      const staticDurationMillis = parseDurationMs(raw?.staticDurationMillis ?? raw?.staticDuration);
-      const trafficDelayMin = computeTrafficDelayMin(durationMillis, staticDurationMillis);
+      const rawDuration =
+        parseDurationMs(raw?.durationMillis ?? raw?.duration) ||
+        sumLegsDurationMs(raw, 'durationMillis');
+      const rawStatic =
+        parseDurationMs(raw?.staticDurationMillis ?? raw?.staticDuration) ||
+        sumLegsDurationMs(raw, 'staticDurationMillis') ||
+        rawDuration;
+      const speedSegments = supportsLiveTraffic ? extractSpeedSegments(raw) : [];
+      const traffic = analyzeRouteTraffic(
+        rawDuration,
+        rawStatic,
+        speedSegments,
+        supportsLiveTraffic
+      );
       const weather = evaluateRouteRainExposure(path, rainZones);
+      const localizedDuration =
+        typeof raw?.localizedValues?.duration === 'string' && raw.localizedValues.duration.trim()
+          ? raw.localizedValues.duration.trim()
+          : null;
+
+      const routeDesc =
+        raw?.description ||
+        (isBypassDetour ? 'Desvío evitando lluvia' : 'Ruta principal');
+
       return {
         id,
-        description:
-          raw?.description ||
-          (isBypassDetour ? 'Desvío evitando lluvia' : 'Ruta principal'),
+        description: routeDesc,
         distanceMeters: Number(raw?.distanceMeters ?? 0),
-        durationMillis,
-        staticDurationMillis,
-        trafficDelayMin,
+        durationMillis: rawDuration,
+        staticDurationMillis: rawStatic,
+        localizedDuration,
+        trafficDelayMin: traffic.delayMin,
+        traffic,
+        speedSegments,
+        trafficUpdatedAt: updatedAt,
         weather,
         isBypassDetour,
         path,
-        steps: extractNavSteps(raw),
+        steps: extractNavSteps(raw, routeDesc),
         viewport: raw?.viewport ?? null,
       };
     };
 
-    (async () => {
+    const fetchLiveRoutes = async (isBackgroundRefresh: boolean) => {
+      if (!isBackgroundRefresh) {
+        onRouteLoading(true);
+        onRouteError(null);
+      }
+
       try {
         const primaryRes = await RouteClass.computeRoutes(buildRequest());
         if (cancelled) return;
 
         const rawRoutes: any[] = Array.isArray(primaryRes?.routes) ? primaryRes.routes : [];
         if (rawRoutes.length === 0) {
-          computedRoutesRef.current = [];
-          onRoutesComputed([], null);
-          onRouteError('No encontramos una ruta disponible para ese destino.');
+          if (!isBackgroundRefresh) {
+            computedRoutesRef.current = [];
+            onRoutesComputed([], null, false);
+            onRouteError(
+              travelMode === 'BICYCLING'
+                ? 'Google Maps no tiene rutas en bicicleta para este tramo. Prueba en Carro, Moto o A pie.'
+                : 'No encontramos una ruta disponible para ese destino.'
+            );
+          }
           return;
         }
 
+        const updatedAt = Date.now();
         const evaluated: ComputedNavRoute[] = rawRoutes.map((r, idx) =>
-          normalizeRoute(r, `route-${idx}`, false)
+          normalizeRoute(r, `route-${idx}`, false, updatedAt)
         );
 
         // If "Evitar lluvia" is enabled and even the driest Google alternative crosses rain,
-        // compute a lateral dry-bypass waypoint around the rain cluster and query Routes API.
+        // compute a lateral dry-bypass waypoint around the rain cluster with live traffic.
         if (avoidRain) {
           const driestDirect = [...evaluated].sort(
             (a, b) => a.weather.rainExposureScore - b.weather.rainExposureScore
@@ -252,7 +398,8 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
                   const bypassRoute = normalizeRoute(
                     bypassRes.routes[0],
                     'route-dry-bypass',
-                    true
+                    true,
+                    updatedAt
                   );
                   if (
                     bypassRoute.weather.rainExposureScore <
@@ -272,24 +419,46 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
 
         const ranked = rankRoutes(evaluated, avoidRain);
         computedRoutesRef.current = ranked;
-        const bestId = ranked[0]?.id ?? null;
-        onRoutesComputed(ranked, bestId);
+        setDrawVersion((v) => v + 1);
+
+        const prevId = selectedRouteIdRef.current;
+        const preservedId =
+          isBackgroundRefresh && prevId && ranked.some((r) => r.id === prevId)
+            ? prevId
+            : ranked[0]?.id ?? null;
+
+        onRoutesComputed(ranked, preservedId, isBackgroundRefresh);
       } catch (err) {
         if (isQuotaError(err)) {
           window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
         }
-        if (!cancelled) {
+        if (!cancelled && !isBackgroundRefresh) {
           computedRoutesRef.current = [];
-          onRoutesComputed([], null);
-          onRouteError('No se pudo calcular la ruta en este momento. Intenta otro destino.');
+          onRoutesComputed([], null, false);
+          onRouteError('No se pudo calcular la ruta con tráfico en vivo. Intenta otro destino.');
         }
       } finally {
-        if (!cancelled) onRouteLoading(false);
+        if (!cancelled && !isBackgroundRefresh) onRouteLoading(false);
       }
-    })();
+    };
+
+    fetchLiveRoutes(false);
+
+    // Keep live traffic ETA & congestion segments fresh every 60s for motorized modes
+    if (supportsLiveTraffic) {
+      autoTickRef.current = window.setInterval(() => {
+        if (!cancelled && document.visibilityState === 'visible') {
+          fetchLiveRoutes(true);
+        }
+      }, LIVE_TRAFFIC_REFRESH_INTERVAL_MS);
+    }
 
     return () => {
       cancelled = true;
+      if (autoTickRef.current !== null) {
+        window.clearInterval(autoTickRef.current);
+        autoTickRef.current = null;
+      }
     };
   }, [
     map,
@@ -301,9 +470,10 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
     travelMode,
     avoidRain,
     stations.length,
+    trafficRefreshNonce,
   ]);
 
-  // Draw polylines & active rain-zone hazard circles whenever routes or selection change
+  // Draw polylines, live traffic congestion overlays (SLOW / TRAFFIC_JAM), & rain hazard circles
   useEffect(() => {
     clearDrawn();
     if (!map || !destination) return;
@@ -311,7 +481,7 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
     const routes = computedRoutesRef.current;
     if (routes.length === 0) return;
 
-    // 1. Highlight active rain zones with soft blue translucent hazard rings so user sees what's avoided
+    // 1. Highlight active rain zones with soft blue translucent hazard rings
     const rainZones = extractRainZones(stations);
     for (const z of rainZones) {
       if (z.severity !== 'active' && z.severity !== 'moderate') continue;
@@ -356,12 +526,13 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
     }
 
     // 3. Draw active selected route on top in distinct Waze-style electric purple (#7C3AED)
-    // so it stands out sharply against green/yellow/red traffic and blue water/radar layers
+    //    + overlay real-time SLOW (amber) and TRAFFIC_JAM (crimson) segments from Google Routes speedPaths
     const active = routes.find((r) => r.id === selectedRouteId) ?? routes[0];
     if (active && active.path.length >= 2) {
-      const mainColor = active.weather.rainExposureScore >= 25
-        ? '#C026D3' // Vivid fuchsia-magenta when unavoidable rain is on the route
-        : '#7C3AED'; // Electric Waze purple for the active route to follow
+      const mainColor =
+        active.weather.rainExposureScore >= 25
+          ? '#C026D3' // Vivid fuchsia-magenta when unavoidable rain is on the route
+          : '#7C3AED'; // Distinct Waze purple for the active route to follow
 
       const outerShadow = new google.maps.Polyline({
         path: active.path,
@@ -391,12 +562,31 @@ export const WazeRouteController: React.FC<WazeRouteControllerProps> = ({
         zIndex: 31,
       });
       polylinesRef.current.push(outerShadow, casing, core);
+
+      // Paint real-time traffic slowdowns & jams directly on top of the active route
+      if (showTraffic && active.speedSegments.length > 0) {
+        for (const seg of active.speedSegments) {
+          if (seg.speed === 'NORMAL' || seg.path.length < 2) continue;
+          const isJam = seg.speed === 'TRAFFIC_JAM';
+          const segLine = new google.maps.Polyline({
+            path: seg.path,
+            map,
+            geodesic: true,
+            strokeColor: isJam ? '#DC2626' : '#F59E0B',
+            strokeOpacity: 1,
+            strokeWeight: 7.5,
+            zIndex: isJam ? 33 : 32,
+          });
+          polylinesRef.current.push(segLine);
+        }
+      }
     }
 
     return () => {
       clearDrawn();
     };
-  }, [map, destination, selectedRouteId, stations, onSelectRoute]);
+  }, [map, destination, selectedRouteId, showTraffic, stations, onSelectRoute, drawVersion]);
 
   return null;
 };
+

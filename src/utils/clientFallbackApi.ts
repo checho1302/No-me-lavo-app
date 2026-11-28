@@ -20,6 +20,9 @@ import {
   describeWeatherCode,
   evaluateAlertRules,
   fuzzCoordinates,
+  isSafeReportPhotoDataUrl,
+  sanitizeRainViewerHost,
+  sanitizeRainViewerTileUrl,
 } from './weatherLogic';
 
 const LOCAL_FAVS_KEY = 'nomelavo_local_favorites_v1';
@@ -181,7 +184,10 @@ export function deleteLocalRule(id: string): CustomAlertRule[] {
 }
 
 export function getLocalReports(): CitizenReport[] {
-  return readLocalList<CitizenReport>(LOCAL_REPORTS_KEY, []);
+  return readLocalList<CitizenReport>(LOCAL_REPORTS_KEY, []).map((rep) => ({
+    ...rep,
+    photoDataUrl: isSafeReportPhotoDataUrl(rep.photoDataUrl) ? rep.photoDataUrl : null,
+  }));
 }
 
 export function addLocalReport(payload: {
@@ -196,6 +202,7 @@ export function addLocalReport(payload: {
   const coords = payload.protectLocation
     ? fuzzCoordinates({ latitude: payload.latitude, longitude: payload.longitude })
     : { latitude: payload.latitude, longitude: payload.longitude };
+  const safePhoto = isSafeReportPhotoDataUrl(payload.photoDataUrl) ? payload.photoDataUrl : null;
   const next: CitizenReport = {
     id: `rep-${Date.now()}`,
     type: payload.type,
@@ -204,7 +211,7 @@ export function addLocalReport(payload: {
     latitude: coords.latitude,
     longitude: coords.longitude,
     locationProtected: payload.protectLocation,
-    photoDataUrl: payload.photoDataUrl,
+    photoDataUrl: safePhoto,
     moderationStatus: 'verificado',
     createdAt: new Date().toISOString(),
   };
@@ -481,28 +488,37 @@ export async function fetchFallbackRadar(): Promise<RadarProductsResponse> {
     };
   }>('https://api.rainviewer.com/public/weather-maps.json');
 
-  const host = rv?.host ?? 'https://tilecache.rainviewer.com';
+  const host = sanitizeRainViewerHost(rv?.host);
   const formatFrameLabel = (unixSec: number, isForecast: boolean) => {
     const dt = new Date(unixSec * 1000);
     const hhmm = dt.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' });
     return isForecast ? `Pronóstico ${hhmm}` : hhmm;
   };
 
+  const buildSafeFrame = (
+    f: { time: number; path: string },
+    isForecast: boolean
+  ): RadarFrame | null => {
+    const tileUrlTemplate = sanitizeRainViewerTileUrl(host, f.path, 2);
+    if (!tileUrlTemplate || !Number.isFinite(f.time)) return null;
+    return {
+      time: f.time,
+      path: f.path,
+      tileUrlTemplate,
+      isForecast,
+      label: formatFrameLabel(f.time, isForecast),
+    };
+  };
+
   const frames: RadarFrame[] = [
-    ...(rv?.radar?.past ?? []).slice(-6).map((f): RadarFrame => ({
-      time: f.time,
-      path: f.path,
-      tileUrlTemplate: `${host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`,
-      isForecast: false,
-      label: formatFrameLabel(f.time, false),
-    })),
-    ...(rv?.radar?.nowcast ?? []).slice(0, 3).map((f): RadarFrame => ({
-      time: f.time,
-      path: f.path,
-      tileUrlTemplate: `${host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`,
-      isForecast: true,
-      label: formatFrameLabel(f.time, true),
-    })),
+    ...(rv?.radar?.past ?? [])
+      .slice(-6)
+      .map((f) => buildSafeFrame(f, false))
+      .filter((f): f is RadarFrame => f !== null),
+    ...(rv?.radar?.nowcast ?? [])
+      .slice(0, 3)
+      .map((f) => buildSafeFrame(f, true))
+      .filter((f): f is RadarFrame => f !== null),
   ];
 
   const nowIso = new Date().toISOString();

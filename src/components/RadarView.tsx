@@ -3,6 +3,7 @@ import L from 'leaflet';
 import { Info, Layers, Pause, Play, RefreshCw, SkipBack, SkipForward } from 'lucide-react';
 import type { RadarProductsResponse, WeatherStation } from '../types/weather';
 import { buildStationTooltipHtml, createStationLeafletIcon } from '../utils/sabMapMarkers';
+import { escapeHtml } from '../utils/weatherLogic';
 
 interface RadarViewProps {
   radar: RadarProductsResponse | null;
@@ -165,7 +166,7 @@ export const RadarView: React.FC<RadarViewProps> = ({
       onEachFeature: (feature, layer) => {
         const props = (feature.properties ?? {}) as { LocNombre?: string };
         if (props.LocNombre) {
-          layer.bindTooltip(`Localidad: ${props.LocNombre}`, { sticky: true });
+          layer.bindTooltip(`Localidad: ${escapeHtml(String(props.LocNombre))}`, { sticky: true });
         }
       },
     }).addTo(map);

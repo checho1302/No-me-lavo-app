@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import zlib from 'node:zlib';
 import {
   calculateDistanceKm,
   classifyRainfallIntensity,
@@ -11,9 +12,14 @@ import {
   formatTemperature,
   formatWind,
   fuzzCoordinates,
+  isSafeReportPhotoDataUrl,
+  isValidEntityId,
+  sanitizeRainViewerHost,
+  sanitizeRainViewerTileUrl,
   validateAlertRuleInput,
   validateCitizenReportInput,
 } from './weatherLogic';
+import { extractZipEntries } from '../../server/sabIngestion';
 
 test('classifySabDailyAccumulation matches official SAB IDIGER Bogotá daily thresholds', () => {
   assert.equal(classifySabDailyAccumulation(null).tier, 'none');
@@ -139,4 +145,151 @@ test('validateAlertRuleInput enforces bounds on name, radius, and rainfall thres
     validateAlertRuleInput({ name: 'Lluvia casa', locality: 'Suba', radiusKm: 8, thresholdMmH: 2.5 }).valid,
     true
   );
+});
+
+test('security: escapeHtml neutralizes tooltip HTML/script injection payloads', () => {
+  const payload = '<img src=x onerror=alert(1)>';
+  const escaped = escapeHtml(payload);
+  assert.equal(escaped.includes('<'), false);
+  assert.equal(escaped.includes('>'), false);
+  assert.equal(escaped, '&lt;img src=x onerror=alert(1)&gt;');
+});
+
+test('security: validators reject non-string object payloads and oversized localities without throwing', () => {
+  assert.equal(
+    validateAlertRuleInput({
+      name: { $gt: '' },
+      locality: 'Chapinero',
+      radiusKm: 5,
+      thresholdMmH: 2,
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateAlertRuleInput({
+      name: 'Regla válida',
+      locality: 'A'.repeat(120),
+      radiusKm: 5,
+      thresholdMmH: 2,
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateCitizenReportInput({
+      type: 'lluvia_fuerte',
+      description: { $ne: null },
+      locality: ['Suba'],
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateCitizenReportInput({
+      type: 'lluvia_fuerte',
+      description: 'Lluvia muy fuerte en la zona norte',
+      locality: 'B'.repeat(100),
+    }).valid,
+    false
+  );
+});
+
+test('security: isSafeReportPhotoDataUrl allows only raster base64 images and blocks SVG/external URLs', () => {
+  assert.equal(isSafeReportPhotoDataUrl('data:image/png;base64,iVBORw0KGgo='), true);
+  assert.equal(isSafeReportPhotoDataUrl('data:image/jpeg;base64,/9j/4AAQ='), true);
+  assert.equal(isSafeReportPhotoDataUrl('data:image/webp;base64,UklGRh4='), true);
+  assert.equal(isSafeReportPhotoDataUrl('data:image/svg+xml;base64,PHN2Zz4='), false);
+  assert.equal(isSafeReportPhotoDataUrl('https://evil.example/tracker.png'), false);
+  assert.equal(isSafeReportPhotoDataUrl('javascript:alert(1)'), false);
+  assert.equal(isSafeReportPhotoDataUrl(null), false);
+});
+
+test('security: sanitizeRainViewerTileUrl restricts host to HTTPS rainviewer.com and blocks path traversal', () => {
+  assert.equal(
+    sanitizeRainViewerHost('https://evil.example'),
+    'https://tilecache.rainviewer.com'
+  );
+  assert.equal(
+    sanitizeRainViewerHost('http://169.254.169.254'),
+    'https://tilecache.rainviewer.com'
+  );
+  assert.equal(
+    sanitizeRainViewerTileUrl('https://tilecache.rainviewer.com', '/v2/radar/1700000000', 6),
+    'https://tilecache.rainviewer.com/v2/radar/1700000000/256/{z}/{x}/{y}/6/1_1.png'
+  );
+  assert.equal(
+    sanitizeRainViewerTileUrl('https://evil.example', '/v2/radar/1700000000', 6),
+    'https://tilecache.rainviewer.com/v2/radar/1700000000/256/{z}/{x}/{y}/6/1_1.png'
+  );
+  assert.equal(
+    sanitizeRainViewerTileUrl('https://tilecache.rainviewer.com', '/../../etc/passwd', 6),
+    null
+  );
+  assert.equal(
+    sanitizeRainViewerTileUrl('https://tilecache.rainviewer.com', 'https://evil.example/x', 6),
+    null
+  );
+});
+
+test('security: isValidEntityId blocks path traversal and malformed IDs', () => {
+  assert.equal(isValidEntityId('sab-idiger-102'), true);
+  assert.equal(isValidEntityId('rule-1a2b3c4d'), true);
+  assert.equal(isValidEntityId('../../etc/passwd'), false);
+  assert.equal(isValidEntityId('<script>alert(1)</script>'), false);
+  assert.equal(isValidEntityId('a'.repeat(80)), false);
+});
+
+function buildSyntheticZip(
+  fileName: string,
+  payload: Buffer,
+  options: { method: 0 | 8; forgedUncompSize?: number }
+): Buffer {
+  const nameBuf = Buffer.from(fileName, 'utf8');
+  const data = options.method === 8 ? zlib.deflateRawSync(payload) : payload;
+  const declaredUncomp = options.forgedUncompSize ?? payload.length;
+
+  const localHeader = Buffer.alloc(30 + nameBuf.length);
+  localHeader.writeUInt32LE(0x04034b50, 0);
+  localHeader.writeUInt16LE(options.method, 8);
+  localHeader.writeUInt32LE(data.length, 18);
+  localHeader.writeUInt32LE(declaredUncomp, 22);
+  localHeader.writeUInt16LE(nameBuf.length, 26);
+  nameBuf.copy(localHeader, 30);
+
+  const cdOffset = localHeader.length + data.length;
+  const cdHeader = Buffer.alloc(46 + nameBuf.length);
+  cdHeader.writeUInt32LE(0x02014b50, 0);
+  cdHeader.writeUInt16LE(options.method, 10);
+  cdHeader.writeUInt32LE(data.length, 20);
+  cdHeader.writeUInt32LE(declaredUncomp, 24);
+  cdHeader.writeUInt16LE(nameBuf.length, 28);
+  cdHeader.writeUInt32LE(0, 42);
+  nameBuf.copy(cdHeader, 46);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(cdHeader.length, 12);
+  eocd.writeUInt32LE(cdOffset, 16);
+
+  return Buffer.concat([localHeader, data, cdHeader, eocd]);
+}
+
+test('security: extractZipEntries blocks path traversal names and forged-header deflate zip bombs', () => {
+  const traversalZip = buildSyntheticZip('../evil.kml', Buffer.from('<kml/>'), { method: 0 });
+  assert.equal(extractZipEntries(traversalZip).size, 0);
+
+  // 6 MB zero-filled buffer compresses to ~6 KB, while forging uncompSize = 100 in ZIP header
+  const bombPayload = Buffer.alloc(6 * 1024 * 1024, 0x41);
+  const forgedBombZip = buildSyntheticZip('doc.kml', bombPayload, {
+    method: 8,
+    forgedUncompSize: 100,
+  });
+  assert.equal(extractZipEntries(forgedBombZip).size, 0);
+
+  // Legitimate small KMZ entry still extracts cleanly
+  const validZip = buildSyntheticZip('doc.kml', Buffer.from('<kml><name>OK</name></kml>'), {
+    method: 8,
+  });
+  const extracted = extractZipEntries(validZip);
+  assert.equal(extracted.get('doc.kml')?.toString('utf8'), '<kml><name>OK</name></kml>');
 });

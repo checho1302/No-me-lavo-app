@@ -347,6 +347,381 @@ export function shouldRecalculateRouteOrigin(
   return distKm * 1000 >= minMoveMeters;
 }
 
+export interface RouteSpeedSegment {
+  speed: 'NORMAL' | 'SLOW' | 'TRAFFIC_JAM';
+  path: LatLngPoint[];
+}
+
+export interface RouteTrafficSummary {
+  delayMin: number;
+  jamSegmentCount: number;
+  slowSegmentCount: number;
+  severity: 'fluid' | 'moderate' | 'heavy';
+  label: string;
+  shortLabel: string;
+}
+
+/**
+ * Classifies real-time traffic conditions along a route using BOTH Google's live
+ * duration vs historical static duration AND live per-segment speed readings (`speedPaths`).
+ * Never claims "Tráfico fluido" when live TRAFFIC_JAM or SLOW segments exist on the route.
+ */
+export function analyzeRouteTraffic(
+  durationMillis: number,
+  staticDurationMillis: number | undefined,
+  speedSegments: RouteSpeedSegment[] = [],
+  supportsLiveTraffic = true
+): RouteTrafficSummary {
+  if (!supportsLiveTraffic) {
+    return {
+      delayMin: 0,
+      jamSegmentCount: 0,
+      slowSegmentCount: 0,
+      severity: 'fluid',
+      label: 'Sin tráfico vehicular',
+      shortLabel: 'Ruta directa',
+    };
+  }
+
+  const delayMin = computeTrafficDelayMin(durationMillis, staticDurationMillis);
+  let jamSegmentCount = 0;
+  let slowSegmentCount = 0;
+
+  for (const seg of speedSegments) {
+    if (seg.speed === 'TRAFFIC_JAM') jamSegmentCount += 1;
+    else if (seg.speed === 'SLOW') slowSegmentCount += 1;
+  }
+
+  if (delayMin >= 8 || (jamSegmentCount >= 2 && delayMin >= 3)) {
+    return {
+      delayMin,
+      jamSegmentCount,
+      slowSegmentCount,
+      severity: 'heavy',
+      label:
+        delayMin > 0
+          ? `Tráfico pesado · +${delayMin} min`
+          : `Trancón en ${jamSegmentCount} tramos`,
+      shortLabel: delayMin > 0 ? `+${delayMin} min trancón` : 'Trancón',
+    };
+  }
+
+  if (delayMin >= 2 || jamSegmentCount > 0 || slowSegmentCount > 0) {
+    const detail =
+      delayMin > 0
+        ? `+${delayMin} min tráfico`
+        : jamSegmentCount > 0
+          ? `Trancón en ${jamSegmentCount === 1 ? '1 tramo' : `${jamSegmentCount} tramos`}`
+          : 'Tráfico lento en tramo';
+    return {
+      delayMin,
+      jamSegmentCount,
+      slowSegmentCount,
+      severity: jamSegmentCount > 0 ? 'heavy' : 'moderate',
+      label: detail,
+      shortLabel: delayMin > 0 ? `+${delayMin} min` : jamSegmentCount > 0 ? 'Trancón' : 'Lento',
+    };
+  }
+
+  return {
+    delayMin: 0,
+    jamSegmentCount: 0,
+    slowSegmentCount: 0,
+    severity: 'fluid',
+    label: 'Tráfico fluido',
+    shortLabel: 'Fluido',
+  };
+}
+
+/**
+ * Formats estimated arrival clock time in Spanish (e.g., "8:28 p. m.") from real live durationMillis.
+ */
+export function formatArrivalTimeEs(durationMillis: number, nowMs = Date.now()): string {
+  const safeDuration = Math.max(60_000, durationMillis);
+  const arrivalDate = new Date(nowMs + safeDuration);
+  return arrivalDate.toLocaleTimeString('es-CO', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
+/**
+ * Computes remaining real-time duration and distance from the active turn-by-turn step index,
+ * preserving Google's live traffic multiplier instead of assuming synthetic fixed speeds.
+ */
+export function computeRemainingTripMetrics(
+  totalDurationMillis: number,
+  totalDistanceMeters: number,
+  steps: Array<{ distanceMeters: number; durationMillis?: number }>,
+  activeStepIdx: number
+): { remainingDurationMillis: number; remainingDistanceMeters: number } {
+  if (steps.length === 0 || activeStepIdx <= 0) {
+    return {
+      remainingDurationMillis: totalDurationMillis,
+      remainingDistanceMeters: totalDistanceMeters,
+    };
+  }
+
+  const clampedIdx = Math.min(activeStepIdx, steps.length - 1);
+  const remainingSteps = steps.slice(clampedIdx);
+  const remainingDist = remainingSteps.reduce((acc, st) => acc + Math.max(0, st.distanceMeters), 0);
+  const totalStepDur = steps.reduce((acc, st) => acc + Math.max(0, st.durationMillis ?? 0), 0);
+  const remainingStepDur = remainingSteps.reduce((acc, st) => acc + Math.max(0, st.durationMillis ?? 0), 0);
+
+  if (totalStepDur > 0 && remainingStepDur > 0) {
+    const ratio = Math.min(1, Math.max(0, remainingStepDur / totalStepDur));
+    return {
+      remainingDurationMillis: Math.max(60_000, Math.round(totalDurationMillis * ratio)),
+      remainingDistanceMeters: remainingDist > 0 ? remainingDist : totalDistanceMeters,
+    };
+  }
+
+  if (totalDistanceMeters > 0 && remainingDist > 0) {
+    const distRatio = Math.min(1, Math.max(0, remainingDist / totalDistanceMeters));
+    return {
+      remainingDurationMillis: Math.max(60_000, Math.round(totalDurationMillis * distRatio)),
+      remainingDistanceMeters: remainingDist,
+    };
+  }
+
+  return {
+    remainingDurationMillis: totalDurationMillis,
+    remainingDistanceMeters: totalDistanceMeters,
+  };
+}
+
+/**
+ * Formats how recently live traffic was refreshed.
+ */
+export function formatLastUpdatedEs(updatedAtMs: number | null, nowMs = Date.now()): string {
+  if (!updatedAtMs) return 'En vivo';
+  const elapsedSec = Math.max(0, Math.floor((nowMs - updatedAtMs) / 1000));
+  if (elapsedSec < 45) return 'Ahora';
+  const mins = Math.max(1, Math.round(elapsedSec / 60));
+  return `Hace ${mins} min`;
+}
+
+export type NavManeuverType =
+  | 'DEPART'
+  | 'STRAIGHT'
+  | 'NAME_CHANGE'
+  | 'TURN_LEFT'
+  | 'TURN_RIGHT'
+  | 'TURN_SLIGHT_LEFT'
+  | 'TURN_SLIGHT_RIGHT'
+  | 'TURN_SHARP_LEFT'
+  | 'TURN_SHARP_RIGHT'
+  | 'UTURN_LEFT'
+  | 'UTURN_RIGHT'
+  | 'RAMP_LEFT'
+  | 'RAMP_RIGHT'
+  | 'FORK_LEFT'
+  | 'FORK_RIGHT'
+  | 'MERGE'
+  | 'ROUNDABOUT_LEFT'
+  | 'ROUNDABOUT_RIGHT'
+  | 'ARRIVE';
+
+export function normalizeManeuver(rawManeuver: unknown, instruction = ''): NavManeuverType {
+  const m = String(rawManeuver ?? '').toUpperCase().trim();
+  const valid: NavManeuverType[] = [
+    'DEPART',
+    'STRAIGHT',
+    'NAME_CHANGE',
+    'TURN_LEFT',
+    'TURN_RIGHT',
+    'TURN_SLIGHT_LEFT',
+    'TURN_SLIGHT_RIGHT',
+    'TURN_SHARP_LEFT',
+    'TURN_SHARP_RIGHT',
+    'UTURN_LEFT',
+    'UTURN_RIGHT',
+    'RAMP_LEFT',
+    'RAMP_RIGHT',
+    'FORK_LEFT',
+    'FORK_RIGHT',
+    'MERGE',
+    'ROUNDABOUT_LEFT',
+    'ROUNDABOUT_RIGHT',
+    'ARRIVE',
+  ];
+  if (valid.includes(m as NavManeuverType)) {
+    return m as NavManeuverType;
+  }
+
+  // Fallback inference from Spanish navigation text if API returns MANEUVER_UNSPECIFIED
+  const lower = instruction.toLowerCase();
+  if (lower.includes('rotonda') || lower.includes('glorieta')) {
+    return lower.includes('izquierda') ? 'ROUNDABOUT_LEFT' : 'ROUNDABOUT_RIGHT';
+  }
+  if (lower.includes('retorno') || lower.includes('vuelta en u') || lower.includes('cambio de sentido')) {
+    return lower.includes('derecha') ? 'UTURN_RIGHT' : 'UTURN_LEFT';
+  }
+  if (lower.includes('ligeramente a la izquierda') || lower.includes('mantente a la izquierda')) {
+    return 'TURN_SLIGHT_LEFT';
+  }
+  if (lower.includes('ligeramente a la derecha') || lower.includes('mantente a la derecha')) {
+    return 'TURN_SLIGHT_RIGHT';
+  }
+  if (lower.includes('izquierda')) return 'TURN_LEFT';
+  if (lower.includes('derecha')) return 'TURN_RIGHT';
+  if (lower.includes('incorpora')) return 'MERGE';
+  return 'STRAIGHT';
+}
+
+function cleanRoadText(raw: string): string {
+  const firstSegment = raw
+    .split(/\n/)[0]
+    .split(/\s+durante\s+/i)[0]
+    .split(/\s+pasa por\s+/i)[0]
+    .split(/\s*\(/)[0]
+    .trim();
+  // If Google returns slash-separated aliases like "Av. Cdad. de Quito/Ave Cra 30/Av NQS", keep the cleanest primary name
+  const parts = firstSegment
+    .split('/')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const chosen = parts[0] ?? firstSegment;
+  return chosen.replace(/[.,;:\s]+$/, '').trim();
+}
+
+/**
+ * Extracts the current road name and target turn road name from a Spanish Google Maps step instruction.
+ */
+export function extractRoadInfoFromInstruction(
+  instruction: string,
+  fallbackRoad = ''
+): { currentRoad: string; targetRoad: string } {
+  const clean = instruction.replace(/\s+/g, ' ').trim();
+  const fallback = cleanRoadText(fallbackRoad);
+
+  // Pattern 1: "Dirígete hacia el sureste en Cl. 93a hacia Cra. 11a"
+  const departMatch = clean.match(/\ben\s+(.+?)\s+hacia\s+(.+)$/i);
+  if (departMatch) {
+    return {
+      currentRoad: cleanRoadText(departMatch[1]) || fallback,
+      targetRoad: cleanRoadText(departMatch[2]) || cleanRoadText(departMatch[1]) || fallback,
+    };
+  }
+
+  // Pattern 2: "... para incorporarte a Av. Cdad. de Quito/Ave Cra 30"
+  const mergeMatch = clean.match(/incorporarte\s+a\s+(.+)$/i);
+  if (mergeMatch) {
+    const road = cleanRoadText(mergeMatch[1]);
+    return { currentRoad: road || fallback, targetRoad: road || fallback };
+  }
+
+  // Pattern 3: "... en dirección Av NQS al Sur"
+  const dirMatch = clean.match(/en\s+direcci[oó]n\s+(?:a\s+)?(.+)$/i);
+  if (dirMatch) {
+    const road = cleanRoadText(dirMatch[1]);
+    return { currentRoad: road || fallback, targetRoad: road || fallback };
+  }
+
+  // Pattern 4: "Continúa por Puente Avenida Carrera 45" / "Mantente a la izquierda para continuar por ..."
+  const porMatch = clean.match(/(?:contin[uú]a|sigue|toma)\s+(?:por|la|el)?\s*(.+)$/i);
+  if (porMatch) {
+    const road = cleanRoadText(porMatch[1].replace(/^(?:por|hacia)\s+/i, ''));
+    return { currentRoad: road || fallback, targetRoad: road || fallback };
+  }
+
+  // Pattern 5: "Gira a la derecha hacia Cra. 11" / "Gira a la izquierda en Cl. 26" / "Gira ligeramente a la derecha por Av. Boyacá"
+  const withoutTurnPhrase = clean.replace(
+    /^(?:gira|dobla|mantente|contin[uú]a|sigue|toma\s+la\s+salida)\s+(?:(?:ligeramente|levemente|fuertemente|pronunciadamente)\s+)?(?:a\s+la\s+(?:derecha|izquierda)|en\s+u)\s*/i,
+    ''
+  );
+  const turnPrepMatch = withoutTurnPhrase.match(/\b(?:hacia|en|por|para\s+tomar|a)\s+(.+)$/i);
+  if (turnPrepMatch) {
+    const road = cleanRoadText(turnPrepMatch[1]);
+    return { currentRoad: road || fallback, targetRoad: road || fallback };
+  }
+
+  return { currentRoad: fallback || 'Vía principal', targetRoad: fallback || clean };
+}
+
+export interface StepBannerDisplay {
+  prefix: string;
+  primaryRoad: string;
+  currentRoad: string;
+  actionShort: string;
+}
+
+/**
+ * Formats a Google Routes step into concise Google Maps / Waze HUD copy:
+ * e.g. prefix="hacia", primaryRoad="Cra. 11a", currentRoad="Cl. 93a"
+ */
+export function parseStepBannerDisplay(
+  step: { instruction: string; maneuver: NavManeuverType },
+  fallbackRoad = ''
+): StepBannerDisplay {
+  const { currentRoad, targetRoad } = extractRoadInfoFromInstruction(step.instruction, fallbackRoad);
+
+  const actionByManeuver: Record<NavManeuverType, { prefix: string; short: string }> = {
+    DEPART: { prefix: 'hacia', short: 'Salir' },
+    STRAIGHT: { prefix: 'Continúa por', short: 'Recto' },
+    NAME_CHANGE: { prefix: 'Sigue por', short: 'Sigue' },
+    TURN_LEFT: { prefix: 'Gira a la izquierda hacia', short: 'Izquierda' },
+    TURN_RIGHT: { prefix: 'Gira a la derecha hacia', short: 'Derecha' },
+    TURN_SLIGHT_LEFT: { prefix: 'Mantente a la izquierda hacia', short: 'Izq. suave' },
+    TURN_SLIGHT_RIGHT: { prefix: 'Mantente a la derecha hacia', short: 'Der. suave' },
+    TURN_SHARP_LEFT: { prefix: 'Giro cerrado a la izquierda', short: 'Izq. cerrada' },
+    TURN_SHARP_RIGHT: { prefix: 'Giro cerrado a la derecha', short: 'Der. cerrada' },
+    UTURN_LEFT: { prefix: 'Retorno en U hacia', short: 'Retorno U' },
+    UTURN_RIGHT: { prefix: 'Retorno en U hacia', short: 'Retorno U' },
+    RAMP_LEFT: { prefix: 'Toma el ramal izq. hacia', short: 'Ramal izq.' },
+    RAMP_RIGHT: { prefix: 'Toma el ramal der. hacia', short: 'Ramal der.' },
+    FORK_LEFT: { prefix: 'Bifurcación izq. hacia', short: 'Izquierda' },
+    FORK_RIGHT: { prefix: 'Bifurcación der. hacia', short: 'Derecha' },
+    MERGE: { prefix: 'Incorpórate a', short: 'Incorporar' },
+    ROUNDABOUT_LEFT: { prefix: 'Glorieta a la izquierda', short: 'Glorieta' },
+    ROUNDABOUT_RIGHT: { prefix: 'Glorieta a la derecha', short: 'Glorieta' },
+    ARRIVE: { prefix: 'Llegada a', short: 'Llegada' },
+  };
+
+  const info = actionByManeuver[step.maneuver] ?? { prefix: 'hacia', short: 'Sigue' };
+  return {
+    prefix: info.prefix,
+    primaryRoad: targetRoad || currentRoad || step.instruction,
+    currentRoad: currentRoad || fallbackRoad || 'Vía actual',
+    actionShort: info.short,
+  };
+}
+
+/**
+ * Matches a live GPS coordinate to the closest active step along the route so the
+ * road name pill and turn banner advance automatically while driving.
+ */
+export function findCurrentStepIndexForGps(
+  livePos: LatLngPoint,
+  steps: Array<{ startLocation: LatLngPoint | null; path?: LatLngPoint[] }>
+): number {
+  if (steps.length === 0) return 0;
+  let bestIdx = 0;
+  let bestDistKm = Infinity;
+
+  for (let i = 0; i < steps.length; i++) {
+    const pts =
+      steps[i].path && steps[i].path!.length > 0
+        ? steps[i].path!
+        : steps[i].startLocation
+          ? [steps[i].startLocation!]
+          : [];
+    for (const pt of pts) {
+      const d = calculateDistanceKm(
+        { latitude: livePos.lat, longitude: livePos.lng },
+        { latitude: pt.lat, longitude: pt.lng }
+      );
+      if (d < bestDistKm) {
+        bestDistKm = d;
+        bestIdx = i;
+      }
+    }
+  }
+
+  return bestIdx;
+}
+
 /**
  * Maps real device GPS coordinates to the nearest known Colombian locality when within range,
  * or returns a neutral live GPS label when the user is outside catalog coverage.
@@ -373,4 +748,103 @@ export function resolveLocalityLabelForGps(
   return { locality: 'Mi ubicación GPS', city: 'En vivo' };
 }
 
+/**
+ * Projects a geographic coordinate `distanceMeters` ahead along `headingDeg` (0° = North, 90° = East).
+ * Used in Waze-style driving mode so the camera looks ahead along the route and places the vehicle
+ * cursor cleanly centered in the lower third of the screen right above the street name pill.
+ */
+export function offsetCenterAhead(
+  origin: LatLngPoint,
+  headingDeg: number,
+  distanceMeters: number
+): LatLngPoint {
+  if (!Number.isFinite(distanceMeters) || distanceMeters === 0) {
+    return origin;
+  }
+  const earthRadiusM = 6_371_000;
+  const angularDist = distanceMeters / earthRadiusM;
+  const bearingRad = (headingDeg * Math.PI) / 180;
+  const lat1 = (origin.lat * Math.PI) / 180;
+  const lng1 = (origin.lng * Math.PI) / 180;
 
+  const sinLat2 =
+    Math.sin(lat1) * Math.cos(angularDist) +
+    Math.cos(lat1) * Math.sin(angularDist) * Math.cos(bearingRad);
+  const lat2 = Math.asin(Math.max(-1, Math.min(1, sinLat2)));
+
+  const y = Math.sin(bearingRad) * Math.sin(angularDist) * Math.cos(lat1);
+  const x = Math.cos(angularDist) - Math.sin(lat1) * Math.sin(lat2);
+  const lng2 = lng1 + Math.atan2(y, x);
+
+  return {
+    lat: (lat2 * 180) / Math.PI,
+    lng: (lng2 * 180) / Math.PI,
+  };
+}
+
+/**
+ * Computes screen-space rotation angle (0..360°) for the vehicle cursor arrow relative to the map's
+ * current heading so it points straight UP (0°) in heading-up 3D navigation and stays accurate in 2D.
+ */
+export function computeRelativeArrowRotation(
+  travelHeadingDeg: number,
+  mapHeadingDeg: number
+): number {
+  if (!Number.isFinite(travelHeadingDeg)) return 0;
+  const safeMapHeading = Number.isFinite(mapHeadingDeg) ? mapHeadingDeg : 0;
+  return ((travelHeadingDeg - safeMapHeading) % 360 + 360) % 360;
+}
+
+export interface TimedGpsFix {
+  lat: number;
+  lng: number;
+  timestampMs: number;
+}
+
+/**
+ * Computes live travel speed in km/h from real mobile GPS telemetry:
+ * 1. Uses native `position.coords.speed` (m/s) when available from device GPS hardware.
+ * 2. Falls back to Haversine distance / delta time between consecutive fixes when `coords.speed` is null.
+ * Filters stationary GPS jitter (< 6 m or < 1.8 km/h) cleanly to 0 km/h.
+ */
+export function computeGpsSpeedKmh(
+  coordsSpeedMps: number | null | undefined,
+  prevFix: TimedGpsFix | null,
+  currFix: TimedGpsFix,
+  prevSpeedKmh: number | null = null
+): number {
+  if (typeof coordsSpeedMps === 'number' && Number.isFinite(coordsSpeedMps) && coordsSpeedMps >= 0) {
+    const rawKmh = coordsSpeedMps * 3.6;
+    if (rawKmh < 1.8) return 0;
+    return Math.min(220, Math.round(rawKmh));
+  }
+
+  if (!prevFix) {
+    return 0;
+  }
+
+  const deltaSec = (currFix.timestampMs - prevFix.timestampMs) / 1000;
+  if (deltaSec < 0.8 || deltaSec > 30) {
+    return 0;
+  }
+
+  const distKm = calculateDistanceKm(
+    { latitude: prevFix.lat, longitude: prevFix.lng },
+    { latitude: currFix.lat, longitude: currFix.lng }
+  );
+  const distMeters = distKm * 1000;
+  if (distMeters < 6) {
+    return 0;
+  }
+
+  const computedKmh = distKm / (deltaSec / 3600);
+  if (!Number.isFinite(computedKmh) || computedKmh < 1.8 || computedKmh > 220) {
+    return 0;
+  }
+
+  if (typeof prevSpeedKmh === 'number' && Number.isFinite(prevSpeedKmh) && prevSpeedKmh > 0) {
+    return Math.min(220, Math.round(computedKmh * 0.7 + prevSpeedKmh * 0.3));
+  }
+
+  return Math.min(220, Math.round(computedKmh));
+}

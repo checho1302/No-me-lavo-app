@@ -16,6 +16,7 @@ import {
   Footprints,
   Info,
   Layers,
+  List,
   Maximize2,
   Minus,
   Navigation,
@@ -29,9 +30,14 @@ import type { FavoriteLocation, RadarProductsResponse, WeatherStation } from '..
 import { classifySabDailyAccumulation } from '../utils/weatherLogic';
 import {
   computeBearingDeg,
+  computeRelativeArrowRotation,
+  computeRemainingTripMetrics,
+  findCurrentStepIndexForGps,
   findNearestPointIndex,
+  formatArrivalTimeEs,
   formatDistanceEs,
   formatDurationEs,
+  offsetCenterAhead,
   shouldRecalculateRouteOrigin,
   type LatLngPoint,
 } from '../utils/routeWeatherLogic';
@@ -39,6 +45,8 @@ import {
   DestinationSearchBar,
   type RouteDestination,
 } from './DestinationSearchBar';
+import { LiveSpeedometer } from './LiveSpeedometer';
+import { TurnManeuverIcon } from './TurnManeuverIcon';
 import {
   WazeRouteController,
   type ComputedNavRoute,
@@ -52,6 +60,8 @@ export interface LiveGpsFix {
   lng: number;
   heading: number | null;
   accuracyM: number | null;
+  speedKmh: number;
+  timestampMs: number;
 }
 
 interface WazeGoogleMapProps {
@@ -111,6 +121,7 @@ const MapOverlaysAndCamera: React.FC<{
   isNavigating: boolean;
   cameraMode: CameraMode;
   onUserDragMap: () => void;
+  onMapHeadingChange: (heading: number) => void;
   radar: RadarProductsResponse | null;
   bogotaGeoJson: unknown | null;
   showTraffic: boolean;
@@ -127,6 +138,7 @@ const MapOverlaysAndCamera: React.FC<{
   isNavigating,
   cameraMode,
   onUserDragMap,
+  onMapHeadingChange,
   radar,
   bogotaGeoJson,
   showTraffic,
@@ -142,16 +154,29 @@ const MapOverlaysAndCamera: React.FC<{
   const dataLoadedRef = useRef(false);
   const lastCityKeyRef = useRef('');
 
-  // Pause auto-follow cleanly if the user drags the map manually
+  const [renderingTypeKey, setRenderingTypeKey] = useState<string>('UNINITIALIZED');
+
+  // Pause auto-follow cleanly if the user drags the map manually & sync actual map heading/rendering type
   useEffect(() => {
     if (!map) return;
-    const listener = map.addListener('dragstart', () => {
+    const syncType = () => {
+      const rt = map.getRenderingType?.();
+      if (rt) setRenderingTypeKey(String(rt));
+    };
+    syncType();
+    const dragListener = map.addListener('dragstart', () => {
       onUserDragMap();
     });
+    const headingListener = map.addListener('heading_changed', () => {
+      onMapHeadingChange(map.getHeading() ?? 0);
+    });
+    const rtListener = map.addListener('renderingtype_changed', syncType);
     return () => {
-      listener.remove();
+      dragListener.remove();
+      headingListener.remove();
+      rtListener.remove();
     };
-  }, [map, onUserDragMap]);
+  }, [map, onUserDragMap, onMapHeadingChange]);
 
   // Live Google Traffic Layer
   useEffect(() => {
@@ -211,18 +236,60 @@ const MapOverlaysAndCamera: React.FC<{
     };
   }, [map, showRadar, radar, radarOpacity]);
 
-  // Waze Close-Up Follow-Me Camera when a route is active
+  // Waze Lower-Third Centered Follow Camera:
+  // - On Vector maps (WebGL): true 3D tilted heading-up view (tilt 55°, heading = route bearing) looking ahead along route
+  // - On Raster fallback maps: clean north-up close-up offset purely north so the chevron stays dead-center horizontally right above the street pill
   useEffect(() => {
     if (!map || !activeRoute) return;
+    const isVector = map.getRenderingType?.() === google.maps.RenderingType.VECTOR;
 
     if (cameraMode === 'follow') {
-      const targetZoom = isNavigating ? 18 : 17;
-      map.panTo(driverPosition);
-      map.setZoom(targetZoom);
+      if (isNavigating) {
+        if (isVector) {
+          const lookAheadCenter = offsetCenterAhead(driverPosition, headingDeg, 78);
+          map.moveCamera({
+            center: lookAheadCenter,
+            zoom: 18.2,
+            tilt: 55,
+            heading: headingDeg,
+          });
+          onMapHeadingChange(map.getHeading() ?? headingDeg);
+        } else {
+          // Raster map stays north-up (heading=0): offset center purely north (~100m at zoom 18)
+          // so the navigation chevron sits dead-center horizontally directly above the street pill
+          const centeredAbovePill = offsetCenterAhead(driverPosition, 0, 100);
+          map.moveCamera({
+            center: centeredAbovePill,
+            zoom: 18,
+          });
+          onMapHeadingChange(0);
+        }
+      } else {
+        // Route preview: center user cleanly in the upper half above the bottom route preview card
+        const previewCenter = offsetCenterAhead(driverPosition, 180, 95);
+        if (isVector) {
+          map.moveCamera({
+            center: previewCenter,
+            zoom: 16.5,
+            tilt: 0,
+            heading: 0,
+          });
+        } else {
+          map.moveCamera({
+            center: previewCenter,
+            zoom: 16.5,
+          });
+        }
+        onMapHeadingChange(0);
+      }
       return;
     }
 
     if (cameraMode === 'overview') {
+      if (isVector) {
+        map.moveCamera({ tilt: 0, heading: 0 });
+      }
+      onMapHeadingChange(0);
       // Frame the entire route only when user explicitly taps "Ver toda la ruta"
       if (activeRoute.path.length > 1) {
         const bounds = new google.maps.LatLngBounds();
@@ -239,8 +306,20 @@ const MapOverlaysAndCamera: React.FC<{
     isNavigating,
     driverPosition.lat,
     driverPosition.lng,
+    headingDeg,
     recenterNonce,
+    renderingTypeKey,
+    onMapHeadingChange,
   ]);
+
+  // Reset tilt & heading back to flat north-up whenever route is cleared
+  useEffect(() => {
+    if (!map || activeRoute) return;
+    if (map.getRenderingType?.() === google.maps.RenderingType.VECTOR) {
+      map.moveCamera({ tilt: 0, heading: 0 });
+    }
+    onMapHeadingChange(0);
+  }, [map, activeRoute, onMapHeadingChange]);
 
   // Recenter cleanly when GPS locks or city/location changes and no route is active
   useEffect(() => {
@@ -311,10 +390,30 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
   const [routeError, setRouteError] = useState<string | null>(null);
   const [isNavigating, setIsNavigating] = useState(false);
   const [activeStepIdx, setActiveStepIdx] = useState(0);
+  const [showStepsList, setShowStepsList] = useState(false);
+  const manualStepPreviewRef = useRef(false);
   const [cameraMode, setCameraMode] = useState<CameraMode>('follow');
+  const [mapHeadingDeg, setMapHeadingDeg] = useState(0);
 
   const [recenterNonce, setRecenterNonce] = useState(0);
   const [zoomDelta, setZoomDelta] = useState({ seq: 0, delta: 0 });
+  const [trafficRefreshNonce, setTrafficRefreshNonce] = useState(0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  // Keep arrival clock ("Llegas 8:28 p. m.") and stale speed decay current
+  useEffect(() => {
+    if (!destination) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), isNavigating ? 5_000 : 30_000);
+    return () => window.clearInterval(id);
+  }, [destination, isNavigating]);
+
+  // Live speed in km/h (decays smoothly to 0 km/h if stationary > 12s with no fresh movement)
+  const displayedSpeedKmh = useMemo(() => {
+    if (gpsStatus !== 'active' || !liveGps) return 0;
+    if (nowMs - liveGps.timestampMs > 12_000) return 0;
+    return liveGps.speedKmh;
+  }, [gpsStatus, liveGps, nowMs]);
 
   // Always prefer the real mobile device GPS position when available (unless user manually picked another city)
   const currentUserPoint: LatLngPoint = useMemo(() => {
@@ -371,9 +470,11 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
       let heading = liveHeading ?? 0;
       if (activeRoute && activeRoute.path.length > 1) {
         const nearestIdx = findNearestPointIndex(livePos, activeRoute.path);
-        const lookAhead = activeRoute.path[Math.min(nearestIdx + 2, activeRoute.path.length - 1)];
-        if (lookAhead && (lookAhead.lat !== livePos.lat || lookAhead.lng !== livePos.lng)) {
-          heading = liveHeading ?? computeBearingDeg(livePos, lookAhead);
+        const anchorPt = activeRoute.path[nearestIdx];
+        const lookAhead =
+          activeRoute.path[Math.min(nearestIdx + 3, activeRoute.path.length - 1)] ?? anchorPt;
+        if (lookAhead && (lookAhead.lat !== anchorPt.lat || lookAhead.lng !== anchorPt.lng)) {
+          heading = liveHeading ?? computeBearingDeg(anchorPt, lookAhead);
         }
       }
       return { driverPosition: livePos, headingDeg: heading };
@@ -393,14 +494,17 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
   }, [isNavigating, gpsStatus, liveGps, activeRoute, activeStepIdx, currentUserPoint]);
 
   const handleRoutesComputed = useCallback(
-    (computed: ComputedNavRoute[], bestId: string | null) => {
+    (computed: ComputedNavRoute[], bestId: string | null, isBackgroundRefresh = false) => {
       setRoutes(computed);
       setSelectedRouteId(bestId);
-      setActiveStepIdx(0);
-      // Immediately center close-up on the user's position along the route (Waze-style)
-      if (computed.length > 0) {
-        setCameraMode('follow');
-        setRecenterNonce((n) => n + 1);
+      setNowMs(Date.now());
+      if (!isBackgroundRefresh) {
+        setActiveStepIdx(0);
+        // Immediately center close-up on the user's position along the route (Waze-style)
+        if (computed.length > 0) {
+          setCameraMode('follow');
+          setRecenterNonce((n) => n + 1);
+        }
       }
     },
     []
@@ -416,11 +520,45 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
     setSelectedRouteId(null);
     setRouteError(null);
     setIsNavigating(false);
+    setShowStepsList(false);
     setActiveStepIdx(0);
+    manualStepPreviewRef.current = false;
     setCameraMode('follow');
   };
 
+  // Automatically advance the current street & upcoming turn based on live mobile GPS while driving
+  useEffect(() => {
+    if (
+      !isNavigating ||
+      manualStepPreviewRef.current ||
+      gpsStatus !== 'active' ||
+      !liveGps ||
+      !activeRoute ||
+      activeRoute.steps.length === 0
+    ) {
+      return;
+    }
+    const matchedIdx = findCurrentStepIndexForGps(
+      { lat: liveGps.lat, lng: liveGps.lng },
+      activeRoute.steps
+    );
+    setActiveStepIdx((prev) => (matchedIdx > prev ? matchedIdx : prev));
+  }, [isNavigating, gpsStatus, liveGps?.lat, liveGps?.lng, activeRoute?.id]);
+
   const activeStep = activeRoute?.steps[activeStepIdx] ?? null;
+  const nextStep = activeRoute?.steps[activeStepIdx + 1] ?? null;
+  const currentRoadLabel =
+    activeStep?.currentRoad || activeRoute?.description || center.locality;
+
+  const navMetrics = useMemo(() => {
+    if (!activeRoute) return null;
+    return computeRemainingTripMetrics(
+      activeRoute.durationMillis,
+      activeRoute.distanceMeters,
+      activeRoute.steps,
+      isNavigating ? activeStepIdx : 0
+    );
+  }, [activeRoute, isNavigating, activeStepIdx]);
 
   return (
     <APIProvider
@@ -455,6 +593,7 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
             isNavigating={isNavigating}
             cameraMode={cameraMode}
             onUserDragMap={handleUserDragMap}
+            onMapHeadingChange={setMapHeadingDeg}
             radar={radar}
             bogotaGeoJson={bogotaGeoJson}
             showTraffic={showTraffic}
@@ -471,35 +610,50 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
             destination={destination ? { lat: destination.lat, lng: destination.lng } : null}
             travelMode={travelMode}
             avoidRain={avoidRain}
+            showTraffic={showTraffic}
             stations={stations}
             selectedRouteId={selectedRouteId}
+            trafficRefreshNonce={trafficRefreshNonce}
             onRoutesComputed={handleRoutesComputed}
             onRouteLoading={setRouteLoading}
             onRouteError={setRouteError}
             onSelectRoute={setSelectedRouteId}
           />
 
-          {/* Driver Position Marker: Live GPS Pulsing Dot or Waze Directional Arrow Puck */}
+          {/* Driver Position Marker: Waze 3D Navigation Chevron or Live GPS Dot */}
           <AdvancedMarker
             position={driverPosition}
             title={gpsStatus === 'active' ? 'Tu ubicación GPS en vivo' : `Tu posición · ${center.locality}`}
             zIndex={50}
           >
             {activeRoute ? (
-              <div className="relative flex items-center justify-center w-12 h-12">
-                <div className="absolute inset-1 rounded-full bg-violet-500/25 border border-violet-400/60" />
+              <div className="relative flex items-center justify-center w-16 h-16">
+                {/* Soft Waze-style circular guidance halo */}
+                <div className="absolute inset-1 rounded-full bg-slate-900/12 dark:bg-sky-400/20 border border-white/50 shadow-inner" />
                 <div
                   style={{
-                    transform: `rotate(${Math.round(headingDeg)}deg)`,
+                    transform: `rotate(${Math.round(
+                      computeRelativeArrowRotation(headingDeg, mapHeadingDeg)
+                    )}deg)`,
                   }}
-                  className="relative w-9 h-9 rounded-full bg-white shadow-xl border-2 border-[#4C1D95] flex items-center justify-center transition-transform duration-300"
+                  className="relative flex items-center justify-center transition-transform duration-300"
                 >
-                  <svg viewBox="0 0 24 24" className="w-5 h-5" aria-hidden="true">
+                  <svg
+                    viewBox="0 0 48 48"
+                    className="w-11 h-11 drop-shadow-[0_6px_10px_rgba(15,23,42,0.42)]"
+                    aria-hidden="true"
+                  >
+                    {/* 3D bottom lip */}
                     <path
-                      d="M12 2.5L20 20L12 16.2L4 20L12 2.5Z"
-                      fill="#7C3AED"
-                      stroke="#3B0764"
-                      strokeWidth="1.3"
+                      d="M24 8 L40 37.5 Q40.8 39.2 39 39.8 L24 34.8 L9 39.8 Q7.2 39.2 8 37.5 Z"
+                      fill="#0E7490"
+                    />
+                    {/* Crisp Waze cyan navigation chevron with thick white rim */}
+                    <path
+                      d="M24 5.5 L39.5 34.5 Q40.3 36.2 38.5 36.8 L24 32 L9.5 36.8 Q7.7 36.2 8.5 34.5 Z"
+                      fill="#06B6D4"
+                      stroke="#FFFFFF"
+                      strokeWidth="3"
                       strokeLinejoin="round"
                     />
                   </svg>
@@ -629,72 +783,118 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
           </div>
         )}
 
-        {/* Active Turn-by-Turn Waze Navigation Top Banner */}
+        {/* Google Maps / Waze-Style Active Turn-by-Turn Top Banner + "Luego" Next-Turn Pill */}
         {isNavigating && activeRoute && (
-          <div className="fixed top-3 left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:w-[440px] z-30 rounded-2xl bg-[#0F213D] text-white shadow-2xl border border-white/15 p-3.5 space-y-2 pt-safe">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-3 min-w-0">
-                <div className="w-10 h-10 rounded-xl bg-emerald-500 text-white flex items-center justify-center shrink-0">
-                  <Navigation className="w-5 h-5" />
+          <div className="fixed top-3 left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:w-[440px] z-30 pointer-events-none pt-safe">
+            {/* Primary Deep Teal Turn Card */}
+            <div className="pointer-events-auto rounded-2xl bg-[#046458] text-white shadow-2xl border border-white/15 px-4 py-3.5">
+              <div className="flex items-center gap-3.5">
+                <div className="flex flex-col items-center justify-center shrink-0 min-w-[46px]">
+                  <TurnManeuverIcon
+                    maneuver={activeStep?.maneuver ?? 'STRAIGHT'}
+                    className="w-9 h-9 text-white"
+                  />
+                  <span className="text-[11px] font-extrabold font-mono tabular-nums text-emerald-100 mt-0.5 leading-none">
+                    {activeStep
+                      ? formatDistanceEs(activeStep.distanceMeters)
+                      : formatDistanceEs(activeRoute.distanceMeters)}
+                  </span>
                 </div>
-                <div className="min-w-0">
-                  <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">
-                    Paso {activeStepIdx + 1} de {Math.max(1, activeRoute.steps.length)} ·{' '}
-                    {activeStep ? formatDistanceEs(activeStep.distanceMeters) : formatDistanceEs(activeRoute.distanceMeters)}
+
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-emerald-100/90 leading-tight truncate">
+                    {activeStep?.bannerPrefix ?? 'hacia'}
                   </p>
-                  <p className="text-sm font-bold leading-snug line-clamp-2 mt-0.5">
-                    {activeStep?.instruction ?? `Dirígete hacia ${destination?.name}`}
+                  <p className="text-[20px] sm:text-[22px] font-extrabold font-display leading-tight tracking-tight truncate mt-0.5">
+                    {activeStep?.primaryRoad ?? destination?.name}
                   </p>
+                  {activeStep?.instruction &&
+                    activeStep.instruction.trim().toLowerCase() !==
+                      `${activeStep.bannerPrefix} ${activeStep.primaryRoad}`.trim().toLowerCase() && (
+                      <p className="text-[11px] text-emerald-50/80 line-clamp-1 mt-0.5">
+                        {activeStep.instruction}
+                      </p>
+                    )}
                 </div>
+
+                {activeRoute.steps.length > 1 && (
+                  <div className="flex flex-col gap-1 shrink-0">
+                    <button
+                      type="button"
+                      disabled={activeStepIdx >= activeRoute.steps.length - 1}
+                      onClick={() => {
+                        manualStepPreviewRef.current = true;
+                        setActiveStepIdx((i) => Math.min(activeRoute.steps.length - 1, i + 1));
+                        setCameraMode('follow');
+                      }}
+                      aria-label="Siguiente giro"
+                      title="Siguiente giro"
+                      className="w-8 h-8 rounded-xl bg-white/15 hover:bg-white/25 disabled:opacity-30 flex items-center justify-center"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={activeStepIdx === 0}
+                      onClick={() => {
+                        manualStepPreviewRef.current = activeStepIdx - 1 > 0;
+                        setActiveStepIdx((i) => Math.max(0, i - 1));
+                        setCameraMode('follow');
+                      }}
+                      aria-label="Giro anterior"
+                      title="Giro anterior"
+                      className="w-8 h-8 rounded-xl bg-white/15 hover:bg-white/25 disabled:opacity-30 flex items-center justify-center"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </div>
-              <button
-                type="button"
-                onClick={() => setIsNavigating(false)}
-                aria-label="Salir de navegación"
-                className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center shrink-0"
-              >
-                <X className="w-4 h-4" />
-              </button>
             </div>
 
-            {activeRoute.steps.length > 1 && (
-              <div className="flex items-center justify-between pt-1.5 border-t border-white/10 text-xs">
-                <button
-                  type="button"
-                  disabled={activeStepIdx === 0}
-                  onClick={() => {
-                    setActiveStepIdx((i) => Math.max(0, i - 1));
-                    setCameraMode('follow');
-                  }}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 disabled:opacity-35 hover:bg-white/20 font-semibold"
-                >
-                  <ChevronLeft className="w-3.5 h-3.5" /> Anterior
-                </button>
-                <span className="text-[11px] text-emerald-300 font-semibold truncate px-2">
-                  {activeRoute.weather.verdictLabel}
+            {/* Attached "Luego [arrow]" Next-Turn Sub-Pill hanging below left edge */}
+            {nextStep && (
+              <div className="pointer-events-auto inline-flex items-center gap-2 ml-3 px-3.5 py-2 rounded-b-2xl bg-[#034C43] text-white shadow-xl border-x border-b border-white/15 max-w-[85%]">
+                <span className="text-xs font-bold text-emerald-100 shrink-0">Luego</span>
+                <TurnManeuverIcon
+                  maneuver={nextStep.maneuver}
+                  className="w-5 h-5 text-white shrink-0"
+                />
+                <span className="text-xs font-semibold text-white/95 truncate">
+                  {nextStep.primaryRoad}
                 </span>
-                <button
-                  type="button"
-                  disabled={activeStepIdx >= activeRoute.steps.length - 1}
-                  onClick={() => {
-                    setActiveStepIdx((i) => Math.min(activeRoute.steps.length - 1, i + 1));
-                    setCameraMode('follow');
-                  }}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 disabled:opacity-35 hover:bg-white/20 font-semibold"
-                >
-                  Siguiente <ChevronRight className="w-3.5 h-3.5" />
-                </button>
               </div>
             )}
           </div>
         )}
 
+        {/* Waze-Style Live Circular Speedometer (km/h) at bottom-left during active navigation */}
+        {isNavigating && activeRoute && !showStepsList && (
+          <div className="fixed bottom-[102px] left-3.5 z-30 pointer-events-none">
+            <LiveSpeedometer speedKmh={displayedSpeedKmh} />
+          </div>
+        )}
+
+        {/* Floating Current Street / Road Pill ("por qué vía va") directly below centered arrow & above dark nav bar */}
+        {isNavigating && activeRoute && !showStepsList && currentRoadLabel && (
+          <div className="fixed bottom-[108px] left-1/2 -translate-x-1/2 z-30 pointer-events-none">
+            <div className="px-4 py-2 rounded-full bg-white text-slate-900 text-xs font-extrabold tracking-tight shadow-[0_8px_20px_rgba(15,23,42,0.22)] border border-slate-200/90 max-w-[180px] sm:max-w-[240px] truncate">
+              {currentRoadLabel}
+            </div>
+          </div>
+        )}
+
         {/* Quick Floating "Centrar en mí" Re-Lock Pill when user pans away from active route */}
-        {activeRoute && cameraMode !== 'follow' && (
-          <div className="fixed left-3.5 bottom-[292px] sm:bottom-64 z-20">
+        {activeRoute && cameraMode !== 'follow' && !showStepsList && (
+          <div
+            className={`fixed left-3.5 z-20 ${
+              isNavigating ? 'bottom-[178px] sm:bottom-44' : 'bottom-[332px] sm:bottom-72'
+            }`}
+          >
             <button
               type="button"
               onClick={() => {
+                manualStepPreviewRef.current = false;
                 setCameraMode('follow');
                 setRecenterNonce((n) => n + 1);
               }}
@@ -709,7 +909,11 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
         {/* Right Edge Minimal Map Controls: Overview/Follow Toggle + Traffic + Zoom + Recenter */}
         <div
           className={`fixed right-3.5 z-20 flex flex-col gap-2 transition-all ${
-            destination ? 'bottom-[292px] sm:bottom-64' : 'bottom-28 sm:bottom-12'
+            destination
+              ? isNavigating
+                ? 'bottom-[142px] sm:bottom-36'
+                : 'bottom-[332px] sm:bottom-72'
+              : 'bottom-28 sm:bottom-12'
           }`}
         >
           {activeRoute && (
@@ -922,29 +1126,147 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
           </div>
         )}
 
-        {/* Waze-Style Bottom Route Summary & Rain-Avoidance Card */}
-        {destination && (
-          <div className="fixed bottom-3 left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:w-[440px] z-30 rounded-3xl bg-white/97 dark:bg-slate-900/97 backdrop-blur-md border border-slate-200 dark:border-slate-700 shadow-2xl p-4 space-y-3 pb-safe">
-            {isNavigating && activeRoute ? (
-              /* Compact live ETA footer bar during navigation */
+        {/* Expandable Turn-by-Turn Directions Drawer (All Steps & Roads along Route) */}
+        {showStepsList && activeRoute && (
+          <div className="fixed inset-x-3 bottom-3 sm:left-1/2 sm:-translate-x-1/2 sm:w-[440px] z-40 max-h-[70vh] flex flex-col rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden pb-safe">
+            <div className="flex items-center justify-between gap-2 px-4 py-3.5 border-b border-slate-200 dark:border-slate-800 bg-[#046458] text-white">
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold text-emerald-100 uppercase tracking-wider">
+                  Vía {activeRoute.description} · {activeRoute.steps.length} giros
+                </p>
+                <p className="text-sm font-extrabold font-display truncate">
+                  {formatDurationEs(
+                    isNavigating && navMetrics
+                      ? navMetrics.remainingDurationMillis
+                      : activeRoute.durationMillis
+                  )}{' '}
+                  · Llegada{' '}
+                  {formatArrivalTimeEs(
+                    isNavigating && navMetrics
+                      ? navMetrics.remainingDurationMillis
+                      : activeRoute.durationMillis,
+                    nowMs
+                  )}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowStepsList(false)}
+                aria-label="Cerrar lista de giros"
+                className="w-9 h-9 rounded-full bg-white/15 hover:bg-white/25 flex items-center justify-center shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+              {activeRoute.steps.map((st, idx) => {
+                const isCurrent = isNavigating && idx === activeStepIdx;
+                return (
+                  <button
+                    key={`${idx}-${st.instruction.slice(0, 18)}`}
+                    type="button"
+                    onClick={() => {
+                      manualStepPreviewRef.current = idx > 0;
+                      setActiveStepIdx(idx);
+                      setIsNavigating(true);
+                      setCameraMode('follow');
+                      setShowStepsList(false);
+                    }}
+                    className={`w-full px-4 py-3 flex items-center gap-3 text-left transition-colors ${
+                      isCurrent
+                        ? 'bg-emerald-50 dark:bg-emerald-950/40'
+                        : 'hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                    }`}
+                  >
+                    <div
+                      className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+                        isCurrent
+                          ? 'bg-[#046458] text-white'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
+                      }`}
+                    >
+                      <TurnManeuverIcon maneuver={st.maneuver} className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold text-slate-900 dark:text-white leading-snug">
+                        {st.instruction}
+                      </p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">
+                        Vía: {st.currentRoad} · {formatDistanceEs(st.distanceMeters)}
+                      </p>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Waze / Google Maps-Style Bottom Route Summary & Dark Navigation ETA Bar */}
+        {destination && !showStepsList && (
+          <div
+            className={`fixed bottom-3 left-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:w-[440px] z-30 rounded-3xl shadow-2xl pb-safe ${
+              isNavigating && activeRoute && navMetrics
+                ? 'bg-[#11151B] text-white border border-white/10 px-4 py-3.5'
+                : 'bg-white/97 dark:bg-slate-900/97 backdrop-blur-md border border-slate-200 dark:border-slate-700 p-4 space-y-3'
+            }`}
+          >
+            {isNavigating && activeRoute && navMetrics ? (
+              /* Sleek Dark Bottom ETA & Arrival Time Bar (matches reference screenshot) */
               <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-xl font-extrabold font-display tabular-nums text-slate-900 dark:text-white leading-none">
-                    {formatDurationEs(activeRoute.durationMillis)}
-                  </p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    {formatDistanceEs(activeRoute.distanceMeters)}
-                    {activeRoute.trafficDelayMin > 0
-                      ? ` · +${activeRoute.trafficDelayMin} min tráfico`
-                      : ' · Tráfico fluido'}
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowStepsList(true)}
+                    aria-label="Ver lista de giros"
+                    title="Ver todos los giros"
+                    className="w-11 h-11 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors"
+                  >
+                    <List className="w-5 h-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTrafficRefreshNonce((n) => n + 1)}
+                    aria-label="Actualizar tráfico en vivo"
+                    title="Actualizar tráfico en vivo"
+                    className="w-9 h-9 rounded-full bg-white/8 hover:bg-white/15 text-slate-300 flex items-center justify-center transition-colors"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${routeLoading ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
+
+                <div className="min-w-0 flex-1 text-center">
+                  <div className="inline-flex items-center justify-center gap-1.5">
+                    <p
+                      className={`text-2xl font-extrabold font-display tabular-nums leading-none ${
+                        activeRoute.traffic.severity === 'heavy'
+                          ? 'text-amber-400'
+                          : activeRoute.traffic.severity === 'moderate'
+                            ? 'text-amber-300'
+                            : 'text-emerald-400'
+                      }`}
+                    >
+                      {formatDurationEs(navMetrics.remainingDurationMillis)}
+                    </p>
+                    {activeRoute.weather.isDry && (
+                      <ShieldCheck
+                        className="w-4 h-4 text-emerald-400 shrink-0"
+                        aria-label="Ruta sin lluvia"
+                      />
+                    )}
+                  </div>
+                  <p className="text-xs font-semibold text-slate-300 tabular-nums mt-1 truncate">
+                    {formatDistanceEs(navMetrics.remainingDistanceMeters)} ·{' '}
+                    {formatArrivalTimeEs(navMetrics.remainingDurationMillis, nowMs)}
                   </p>
                 </div>
+
                 <button
                   type="button"
                   onClick={handleClearRoute}
-                  className="min-h-[44px] px-5 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white text-sm font-bold shadow"
+                  className="min-h-[44px] px-5 rounded-full bg-[#E53935] hover:bg-[#D32F2F] text-white text-sm font-bold shadow-lg shrink-0 transition-colors"
                 >
-                  Finalizar
+                  Salir
                 </button>
               </div>
             ) : (
@@ -1059,11 +1381,27 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                                   : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/60'
                               }`}
                             >
-                              <p className="text-xs font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                                {formatDurationEs(rt.durationMillis)} · {formatDistanceEs(rt.distanceMeters)}
+                              <div className="flex items-center gap-1.5">
+                                <p className="text-xs font-bold font-mono tabular-nums text-slate-900 dark:text-white">
+                                  {formatDurationEs(rt.durationMillis)} · {formatDistanceEs(rt.distanceMeters)}
+                                </p>
+                                {rt.traffic.severity !== 'fluid' && (
+                                  <span
+                                    className={`text-[10px] font-bold ${
+                                      rt.traffic.severity === 'heavy'
+                                        ? 'text-rose-600 dark:text-rose-400'
+                                        : 'text-amber-600 dark:text-amber-400'
+                                    }`}
+                                  >
+                                    · {rt.traffic.shortLabel}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[11px] font-semibold text-slate-600 dark:text-slate-300 truncate max-w-[180px] mt-0.5">
+                                Por {rt.description}
                               </p>
                               <p
-                                className={`text-[11px] font-semibold mt-0.5 ${
+                                className={`text-[10px] font-semibold mt-0.5 ${
                                   rt.weather.isDry
                                     ? 'text-emerald-700 dark:text-emerald-400'
                                     : 'text-amber-700 dark:text-amber-400'
@@ -1082,18 +1420,45 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                       </div>
                     )}
 
-                    {/* Primary ETA + Rain Verdict + Start Navigation CTA */}
-                    <div className="flex items-center justify-between gap-3 pt-1">
-                      <div className="min-w-0">
+                    {/* Primary Real-Time ETA + Arrival Clock + Via Road + Traffic + Turns + Start CTA */}
+                    <div className="flex items-center justify-between gap-2.5 pt-0.5">
+                      <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
-                          <span className="text-2xl font-extrabold font-display tabular-nums text-slate-900 dark:text-white leading-none">
+                          <span className="text-2xl font-extrabold font-display tabular-nums text-slate-900 dark:text-white leading-none shrink-0">
                             {formatDurationEs(activeRoute.durationMillis)}
                           </span>
-                          <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                            {formatDistanceEs(activeRoute.distanceMeters)}
+                          <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 shrink-0">
+                            · {formatDistanceEs(activeRoute.distanceMeters)}
                           </span>
                         </div>
-                        <p className="text-xs font-semibold mt-1 truncate">
+                        <div className="flex items-center gap-1.5 mt-1 text-xs min-w-0">
+                          <span className="font-bold text-[#046458] dark:text-emerald-400 tabular-nums shrink-0">
+                            Llegas {formatArrivalTimeEs(activeRoute.durationMillis, nowMs)}
+                          </span>
+                          <span className="text-slate-400 shrink-0">·</span>
+                          <span
+                            className={`font-bold truncate ${
+                              activeRoute.traffic.severity === 'heavy'
+                                ? 'text-rose-600 dark:text-rose-400'
+                                : activeRoute.traffic.severity === 'moderate'
+                                  ? 'text-amber-600 dark:text-amber-400'
+                                  : 'text-emerald-700 dark:text-emerald-400'
+                            }`}
+                          >
+                            {activeRoute.traffic.shortLabel}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setTrafficRefreshNonce((n) => n + 1)}
+                            aria-label="Actualizar tráfico en vivo"
+                            title="Actualizar tráfico en vivo"
+                            className="p-1 -my-1 rounded-md text-slate-500 hover:text-slate-800 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${routeLoading ? 'animate-spin' : ''}`} />
+                          </button>
+                        </div>
+                        <p className="text-[11px] font-semibold text-slate-600 dark:text-slate-300 mt-0.5 truncate">
+                          Por {activeRoute.description} ·{' '}
                           <span
                             className={
                               activeRoute.weather.isDry
@@ -1101,30 +1466,40 @@ export const WazeGoogleMap: React.FC<WazeGoogleMapProps> = ({
                                 : 'text-amber-700 dark:text-amber-400'
                             }
                           >
-                            {activeRoute.weather.verdictLabel}
+                            {activeRoute.weather.isDry
+                              ? 'Sin lluvia'
+                              : `${activeRoute.weather.wetPercentage}% lluvia`}
                           </span>
-                          {activeRoute.trafficDelayMin > 0 && (
-                            <span className="text-slate-500 dark:text-slate-400">
-                              {' '}
-                              · +{activeRoute.trafficDelayMin} min tráfico
-                            </span>
-                          )}
                         </p>
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveStepIdx(0);
-                          setCameraMode('follow');
-                          setIsNavigating(true);
-                          setRecenterNonce((n) => n + 1);
-                        }}
-                        className="min-h-[46px] px-5 rounded-2xl bg-[#0F213D] dark:bg-sky-500 hover:bg-[#17325C] dark:hover:bg-sky-400 text-white text-sm font-bold inline-flex items-center gap-2 shadow-lg shrink-0"
-                      >
-                        <Navigation className="w-4 h-4" />
-                        Iniciar
-                      </button>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {activeRoute.steps.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowStepsList(true)}
+                            aria-label="Ver giros de la ruta"
+                            title="Ver todos los giros"
+                            className="w-11 h-11 rounded-2xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center"
+                          >
+                            <List className="w-4 h-4" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            manualStepPreviewRef.current = false;
+                            setActiveStepIdx(0);
+                            setCameraMode('follow');
+                            setIsNavigating(true);
+                            setRecenterNonce((n) => n + 1);
+                          }}
+                          className="min-h-[46px] px-4 rounded-2xl bg-[#046458] hover:bg-[#035248] text-white text-sm font-bold inline-flex items-center gap-1.5 shadow-lg"
+                        >
+                          <Navigation className="w-4 h-4" />
+                          Iniciar
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ) : null}

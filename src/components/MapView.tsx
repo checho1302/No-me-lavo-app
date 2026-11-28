@@ -3,7 +3,7 @@ import L from 'leaflet';
 import { Bell, ChevronRight, Crosshair, Layers, Maximize2, Search } from 'lucide-react';
 import type { RadarProductsResponse, WeatherAlert, WeatherStation } from '../types/weather';
 import { buildStationTooltipHtml, createStationLeafletIcon } from '../utils/sabMapMarkers';
-import { classifySabDailyAccumulation } from '../utils/weatherLogic';
+import { classifySabDailyAccumulation, escapeHtml } from '../utils/weatherLogic';
 
 interface MapViewProps {
   center: { latitude: number; longitude: number; locality: string; city: string };
@@ -157,7 +157,7 @@ export const MapView: React.FC<MapViewProps> = ({
       onEachFeature: (feature, layer) => {
         const props = (feature.properties ?? {}) as { LocNombre?: string };
         if (props.LocNombre) {
-          layer.bindTooltip(`Localidad: ${props.LocNombre}`, { sticky: true });
+          layer.bindTooltip(`Localidad: ${escapeHtml(String(props.LocNombre))}`, { sticky: true });
         }
       },
     }).addTo(map);
@@ -231,7 +231,7 @@ export const MapView: React.FC<MapViewProps> = ({
           fillColor: strokeColor,
           fillOpacity: 0.07,
         })
-          .bindTooltip(`${alert.title} · ${alert.locality}`, { sticky: true })
+          .bindTooltip(`${escapeHtml(alert.title)} · ${escapeHtml(alert.locality)}`, { sticky: true })
           .addTo(group);
       });
     }
@@ -244,7 +244,7 @@ export const MapView: React.FC<MapViewProps> = ({
       fillColor: '#1D4ED8',
       fillOpacity: 0.95,
     })
-      .bindTooltip(`${center.locality} (Ubicación seleccionada)`, { direction: 'top' })
+      .bindTooltip(`${escapeHtml(center.locality)} (Ubicación seleccionada)`, { direction: 'top' })
       .addTo(group);
 
     // Render ALL filtered stations with SAB triangle markers (△)

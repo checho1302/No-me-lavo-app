@@ -39,8 +39,10 @@ import {
   toggleLocalRule,
 } from './utils/clientFallbackApi';
 import {
+  computeGpsSpeedKmh,
   resolveLocalityLabelForGps,
   shouldRecalculateRouteOrigin,
+  type TimedGpsFix,
 } from './utils/routeWeatherLogic';
 import { formatTemperature } from './utils/weatherLogic';
 
@@ -130,9 +132,12 @@ export default function App() {
     lng: number;
     heading: number | null;
     accuracyM: number | null;
+    speedKmh: number;
+    timestampMs: number;
   } | null>(null);
   const manualOverrideRef = React.useRef(false);
   const lastWeatherGpsRef = React.useRef<{ lat: number; lng: number } | null>(null);
+  const lastTimedGpsRef = React.useRef<(TimedGpsFix & { speedKmh: number }) | null>(null);
 
   // Sync Tailwind .dark class on <html>
   useEffect(() => {
@@ -308,8 +313,20 @@ export default function App() {
         typeof pos.coords.accuracy === 'number' && Number.isFinite(pos.coords.accuracy)
           ? Math.round(pos.coords.accuracy)
           : null;
+      const timestampMs =
+        typeof pos.timestamp === 'number' && Number.isFinite(pos.timestamp) && pos.timestamp > 0
+          ? pos.timestamp
+          : Date.now();
+      const prevFix = lastTimedGpsRef.current;
+      const speedKmh = computeGpsSpeedKmh(
+        pos.coords.speed,
+        prevFix,
+        { lat, lng, timestampMs },
+        prevFix?.speedKmh ?? null
+      );
+      lastTimedGpsRef.current = { lat, lng, timestampMs, speedKmh };
 
-      setLiveGps({ lat, lng, heading, accuracyM });
+      setLiveGps({ lat, lng, heading, accuracyM, speedKmh, timestampMs });
       setGpsStatus('active');
       setGpsLoading(false);
       setGpsError(null);

@@ -224,29 +224,88 @@ export interface ValidationResult {
   error?: string;
 }
 
+const SAFE_REPORT_PHOTO_RE = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/;
+const SAFE_ENTITY_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const SAFE_RAINVIEWER_PATH_RE = /^\/[a-zA-Z0-9/_-]{1,120}$/;
+
+export function isSafeReportPhotoDataUrl(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 1_800_000 &&
+    SAFE_REPORT_PHOTO_RE.test(value)
+  );
+}
+
+export function isValidEntityId(value: unknown): value is string {
+  return typeof value === 'string' && SAFE_ENTITY_ID_RE.test(value);
+}
+
+export function sanitizeRainViewerHost(host: unknown): string {
+  if (typeof host !== 'string') return 'https://tilecache.rainviewer.com';
+  try {
+    const parsed = new URL(host.trim());
+    const hostname = parsed.hostname.toLowerCase();
+    const isAllowedHost =
+      hostname === 'tilecache.rainviewer.com' || hostname.endsWith('.rainviewer.com');
+    if (
+      parsed.protocol === 'https:' &&
+      isAllowedHost &&
+      !parsed.username &&
+      !parsed.password &&
+      !parsed.port
+    ) {
+      return parsed.origin;
+    }
+  } catch {
+    // Fall through to safe default
+  }
+  return 'https://tilecache.rainviewer.com';
+}
+
+export function sanitizeRainViewerTileUrl(
+  host: unknown,
+  framePath: unknown,
+  colorScheme: 2 | 6 = 6
+): string | null {
+  if (typeof framePath !== 'string') return null;
+  const trimmedPath = framePath.trim();
+  if (!SAFE_RAINVIEWER_PATH_RE.test(trimmedPath) || trimmedPath.includes('..')) {
+    return null;
+  }
+  const safeOrigin = sanitizeRainViewerHost(host);
+  return `${safeOrigin}${trimmedPath}/256/{z}/{x}/{y}/${colorScheme}/1_1.png`;
+}
+
 export function validateCitizenReportInput(input: {
-  type?: string;
-  description?: string;
-  locality?: string;
-  photoDataUrl?: string | null;
+  type?: unknown;
+  description?: unknown;
+  locality?: unknown;
+  photoDataUrl?: unknown;
 }): ValidationResult {
   const allowedTypes = ['lluvia_ligera', 'lluvia_fuerte', 'granizo', 'encharcamiento', 'tormenta'];
-  if (!input.type || !allowedTypes.includes(input.type)) {
+  if (typeof input.type !== 'string' || !allowedTypes.includes(input.type)) {
     return { valid: false, error: 'Selecciona un tipo de fenómeno válido.' };
   }
-  const desc = (input.description ?? '').trim();
+  if (typeof input.description !== 'string') {
+    return { valid: false, error: 'Describe brevemente lo que observas (mínimo 6 caracteres).' };
+  }
+  const desc = input.description.trim();
   if (desc.length < 6) {
     return { valid: false, error: 'Describe brevemente lo que observas (mínimo 6 caracteres).' };
   }
   if (desc.length > 280) {
     return { valid: false, error: 'La descripción no puede superar 280 caracteres.' };
   }
-  if (!input.locality || input.locality.trim().length < 2) {
+  if (typeof input.locality !== 'string') {
     return { valid: false, error: 'Indica la localidad o zona aproximada.' };
   }
-  if (input.photoDataUrl) {
-    const validImagePrefix = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/;
-    if (!validImagePrefix.test(input.photoDataUrl) || input.photoDataUrl.length > 1_800_000) {
+  const locality = input.locality.trim();
+  if (locality.length < 2 || locality.length > 80) {
+    return { valid: false, error: 'Indica una localidad válida (entre 2 y 80 caracteres).' };
+  }
+  if (input.photoDataUrl !== undefined && input.photoDataUrl !== null && input.photoDataUrl !== '') {
+    if (!isSafeReportPhotoDataUrl(input.photoDataUrl)) {
       return { valid: false, error: 'La fotografía debe ser PNG, JPG o WEBP y pesar menos de 1.3 MB.' };
     }
   }
@@ -254,17 +313,24 @@ export function validateCitizenReportInput(input: {
 }
 
 export function validateAlertRuleInput(input: {
-  name?: string;
-  locality?: string;
-  radiusKm?: number;
-  thresholdMmH?: number;
+  name?: unknown;
+  locality?: unknown;
+  radiusKm?: unknown;
+  thresholdMmH?: unknown;
 }): ValidationResult {
-  const name = (input.name ?? '').trim();
+  if (typeof input.name !== 'string') {
+    return { valid: false, error: 'Escribe un nombre de regla entre 3 y 60 caracteres.' };
+  }
+  const name = input.name.trim();
   if (name.length < 3 || name.length > 60) {
     return { valid: false, error: 'Escribe un nombre de regla entre 3 y 60 caracteres.' };
   }
-  if (!input.locality || input.locality.trim().length < 2) {
+  if (typeof input.locality !== 'string') {
     return { valid: false, error: 'Selecciona una localidad para vigilar.' };
+  }
+  const locality = input.locality.trim();
+  if (locality.length < 2 || locality.length > 80) {
+    return { valid: false, error: 'Selecciona una localidad válida (entre 2 y 80 caracteres).' };
   }
   const radius = Number(input.radiusKm);
   if (!Number.isFinite(radius) || radius < 1 || radius > 50) {

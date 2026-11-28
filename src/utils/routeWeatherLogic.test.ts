@@ -2,14 +2,24 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { WeatherStation } from '../types/weather';
 import {
+  analyzeRouteTraffic,
   computeBearingDeg,
   computeDryBypassWaypoint,
+  computeGpsSpeedKmh,
+  computeRelativeArrowRotation,
+  computeRemainingTripMetrics,
   computeTrafficDelayMin,
   evaluateRouteRainExposure,
   extractRainZones,
+  findCurrentStepIndexForGps,
   findNearestPointIndex,
+  formatArrivalTimeEs,
   formatDistanceEs,
   formatDurationEs,
+  formatLastUpdatedEs,
+  normalizeManeuver,
+  offsetCenterAhead,
+  parseStepBannerDisplay,
   rankRoutes,
   resolveLocalityLabelForGps,
   shouldRecalculateRouteOrigin,
@@ -192,3 +202,146 @@ test('resolveLocalityLabelForGps matches nearby locality and falls back cleanly 
   assert.equal(outside.city, 'En vivo');
 });
 
+test('analyzeRouteTraffic reports live jams even when duration <= staticDuration and flags heavy delays', () => {
+  const jamNoDelay = analyzeRouteTraffic(42 * 60_000, 43 * 60_000, [
+    { speed: 'NORMAL', path: [] },
+    { speed: 'TRAFFIC_JAM', path: [] },
+    { speed: 'TRAFFIC_JAM', path: [] },
+  ]);
+  assert.equal(jamNoDelay.severity, 'heavy');
+  assert.equal(jamNoDelay.jamSegmentCount, 2);
+  assert.match(jamNoDelay.label, /Trancón/);
+
+  const heavyDelay = analyzeRouteTraffic(55 * 60_000, 42 * 60_000, [
+    { speed: 'SLOW', path: [] },
+    { speed: 'TRAFFIC_JAM', path: [] },
+  ]);
+  assert.equal(heavyDelay.severity, 'heavy');
+  assert.equal(heavyDelay.delayMin, 13);
+  assert.match(heavyDelay.label, /\+13 min/);
+
+  const fluid = analyzeRouteTraffic(20 * 60_000, 21 * 60_000, [{ speed: 'NORMAL', path: [] }]);
+  assert.equal(fluid.severity, 'fluid');
+  assert.equal(fluid.label, 'Tráfico fluido');
+
+  const walking = analyzeRouteTraffic(30 * 60_000, 30 * 60_000, [], false);
+  assert.equal(walking.label, 'Sin tráfico vehicular');
+});
+
+test('computeRemainingTripMetrics scales remaining duration accurately across navigation steps', () => {
+  const steps = [
+    { distanceMeters: 2000, durationMillis: 300_000 },
+    { distanceMeters: 4000, durationMillis: 600_000 },
+    { distanceMeters: 4000, durationMillis: 600_000 },
+  ];
+  // Total live duration = 30 min (double static 15 min due to live traffic)
+  const atStart = computeRemainingTripMetrics(30 * 60_000, 10_000, steps, 0);
+  assert.equal(atStart.remainingDurationMillis, 30 * 60_000);
+  assert.equal(atStart.remainingDistanceMeters, 10_000);
+
+  // At step 1, 1200s of 1500s remain (80%) => 24 min remaining, 8 km remaining
+  const atStep1 = computeRemainingTripMetrics(30 * 60_000, 10_000, steps, 1);
+  assert.equal(atStep1.remainingDurationMillis, 24 * 60_000);
+  assert.equal(atStep1.remainingDistanceMeters, 8000);
+});
+
+test('formatArrivalTimeEs and formatLastUpdatedEs produce valid Spanish strings', () => {
+  const now = Date.UTC(2026, 10, 26, 20, 0, 0);
+  const arrival = formatArrivalTimeEs(30 * 60_000, now);
+  assert.ok(arrival.length > 0 && /\d/.test(arrival));
+  assert.equal(formatLastUpdatedEs(now - 10_000, now), 'Ahora');
+  assert.equal(formatLastUpdatedEs(now - 125_000, now), 'Hace 2 min');
+});
+
+test('extractRoadInfoFromInstruction and parseStepBannerDisplay parse real Bogotá Spanish instructions', () => {
+  const depart = parseStepBannerDisplay(
+    {
+      maneuver: normalizeManeuver('DEPART', 'Dirígete hacia el sureste en Cl. 93a hacia Cra. 11a'),
+      instruction: 'Dirígete hacia el sureste en Cl. 93a hacia Cra. 11a',
+    },
+    'Av. El Dorado'
+  );
+  assert.equal(depart.currentRoad, 'Cl. 93a');
+  assert.equal(depart.primaryRoad, 'Cra. 11a');
+  assert.equal(depart.prefix, 'hacia');
+
+  const turnRight = parseStepBannerDisplay(
+    {
+      maneuver: normalizeManeuver('TURN_RIGHT', 'Gira a la derecha hacia Cra. 11'),
+      instruction: 'Gira a la derecha hacia Cra. 11',
+    },
+    'Av. El Dorado'
+  );
+  assert.equal(turnRight.currentRoad, 'Cra. 11');
+  assert.equal(turnRight.primaryRoad, 'Cra. 11');
+  assert.match(turnRight.prefix, /derecha/i);
+
+  const rampMerge = parseStepBannerDisplay(
+    {
+      maneuver: normalizeManeuver(
+        'RAMP_RIGHT',
+        'Gira ligeramente a la derecha para incorporarte a Av. Cdad. de Quito/Ave Cra 30'
+      ),
+      instruction: 'Gira ligeramente a la derecha para incorporarte a Av. Cdad. de Quito/Ave Cra 30',
+    },
+    'Av. El Dorado'
+  );
+  assert.equal(rampMerge.currentRoad, 'Av. Cdad. de Quito');
+  assert.equal(rampMerge.primaryRoad, 'Av. Cdad. de Quito');
+});
+
+test('findCurrentStepIndexForGps identifies the closest step along a route', () => {
+  const steps = [
+    { startLocation: { lat: 4.676, lng: -74.048 }, path: [{ lat: 4.676, lng: -74.048 }] },
+    { startLocation: { lat: 4.674, lng: -74.052 }, path: [{ lat: 4.674, lng: -74.052 }] },
+    { startLocation: { lat: 4.668, lng: -74.065 }, path: [{ lat: 4.668, lng: -74.065 }] },
+  ];
+  assert.equal(findCurrentStepIndexForGps({ lat: 4.6742, lng: -74.0518 }, steps), 1);
+  assert.equal(findCurrentStepIndexForGps({ lat: 4.6675, lng: -74.0655 }, steps), 2);
+});
+
+test('offsetCenterAhead shifts camera center forward along heading for lower-third cursor framing', () => {
+  const origin = { lat: 4.6761, lng: -74.0483 };
+  const northAhead = offsetCenterAhead(origin, 0, 100);
+  assert.ok(northAhead.lat > origin.lat);
+  assert.ok(Math.abs(northAhead.lng - origin.lng) < 0.0001);
+
+  const eastAhead = offsetCenterAhead(origin, 90, 100);
+  assert.ok(eastAhead.lng > origin.lng);
+  assert.ok(Math.abs(eastAhead.lat - origin.lat) < 0.0001);
+});
+
+test('computeRelativeArrowRotation keeps chevron pointing up in heading-up mode', () => {
+  assert.equal(computeRelativeArrowRotation(135, 135), 0);
+  assert.equal(computeRelativeArrowRotation(135, 0), 135);
+  assert.equal(computeRelativeArrowRotation(10, 350), 20);
+});
+
+test('computeGpsSpeedKmh uses native GPS speed or computes fallback velocity while filtering jitter', () => {
+  // Native GPS speed (10 m/s = 36 km/h)
+  assert.equal(
+    computeGpsSpeedKmh(10, null, { lat: 4.6761, lng: -74.0483, timestampMs: 10000 }),
+    36
+  );
+  // Stationary jitter (< 1.8 km/h) clamps cleanly to 0
+  assert.equal(
+    computeGpsSpeedKmh(0.2, null, { lat: 4.6761, lng: -74.0483, timestampMs: 10000 }),
+    0
+  );
+  // Fallback calculation: ~111m North in 10 seconds ≈ 40 km/h
+  const fallbackKmh = computeGpsSpeedKmh(
+    null,
+    { lat: 4.6760, lng: -74.0483, timestampMs: 10000 },
+    { lat: 4.6770, lng: -74.0483, timestampMs: 20000 }
+  );
+  assert.ok(fallbackKmh >= 38 && fallbackKmh <= 42, `expected ~40 km/h, got ${fallbackKmh}`);
+  // Tiny 2-meter GPS drift returns 0 km/h
+  assert.equal(
+    computeGpsSpeedKmh(
+      null,
+      { lat: 4.6760, lng: -74.0483, timestampMs: 10000 },
+      { lat: 4.676015, lng: -74.0483, timestampMs: 15000 }
+    ),
+    0
+  );
+});
